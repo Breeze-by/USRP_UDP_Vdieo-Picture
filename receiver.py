@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import queue
 import socket
@@ -365,6 +366,7 @@ class SessionState:
     live_player: LivePlayer | None = None
     playback_disabled_reason: str | None = None
     playback_pending: dict[int, bytes] = field(default_factory=dict)
+    playback_pending_order: list[int] = field(default_factory=list)
     chunks_received: int = 0
     received_payload_bytes: int = 0
     playback_bytes_emitted: int = 0
@@ -373,6 +375,8 @@ class SessionState:
     end_received: bool = False
     playback_min_start_bytes: int = 256 * 1024
     playback_start_timeout: float = 1.0
+    playback_gap_skip_timeout: float = 0.5
+    playback_skipped_chunks: int = 0
     last_activity: float = field(default_factory=time.monotonic)
     last_flush: float = field(default_factory=time.monotonic)
     last_report_rx_bytes: int = 0
@@ -434,6 +438,8 @@ class SessionState:
             )
             if self.chunks_received > self.next_playback_chunk:
                 line += f", wait {self.next_playback_chunk}"
+            if self.playback_skipped_chunks > 0:
+                line += f", skipped {self.playback_skipped_chunks}"
         return line
 
     def live_buffer_bytes(self) -> int:
@@ -504,6 +510,7 @@ class SessionState:
             "chunks_received": self.chunks_received,
             "missing_chunks": self.total_chunks - self.chunks_received,
             "playback_bytes_emitted": self.playback_bytes_emitted,
+            "playback_skipped_chunks": self.playback_skipped_chunks,
         }
         self.manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -535,6 +542,7 @@ class SessionState:
         if chunk_id in self.playback_pending:
             return
         self.playback_pending[chunk_id] = payload
+        heapq.heappush(self.playback_pending_order, chunk_id)
         self.playback_pending_bytes += len(payload)
         self._drain_live_stream()
 
@@ -554,6 +562,7 @@ class SessionState:
             advanced = True
         if advanced:
             self.last_ready_advance = time.monotonic()
+        self._discard_stale_pending_order()
 
     def _service_playback_waiting(self) -> list[str]:
         if self.live_player is None:
@@ -577,6 +586,23 @@ class SessionState:
                 )
                 messages.extend(self.live_player.service())
 
+        next_available = self._next_available_pending_chunk()
+        if (
+            self.playback_gap_skip_timeout > 0
+            and next_available is not None
+            and next_available > self.next_playback_chunk
+            and stalled >= self.playback_gap_skip_timeout
+        ):
+            skipped = next_available - self.next_playback_chunk
+            self.playback_skipped_chunks += skipped
+            messages.append(
+                f"Playback    : session {self.session_id:016x} skipped {skipped} missing chunks, "
+                f"resume at chunk {next_available}"
+            )
+            self.next_playback_chunk = next_available
+            self._drain_live_stream()
+            stalled = 0.0
+
         if (
             self.chunks_received > self.next_playback_chunk
             and stalled >= 1.0
@@ -593,6 +619,20 @@ class SessionState:
             self.last_wait_report_at = now
 
         return messages
+
+    def _discard_stale_pending_order(self) -> None:
+        while self.playback_pending_order:
+            chunk_id = self.playback_pending_order[0]
+            if chunk_id < self.next_playback_chunk or chunk_id not in self.playback_pending:
+                heapq.heappop(self.playback_pending_order)
+                continue
+            break
+
+    def _next_available_pending_chunk(self) -> int | None:
+        self._discard_stale_pending_order()
+        if not self.playback_pending_order:
+            return None
+        return self.playback_pending_order[0]
 
     def _is_ts_transport(self) -> bool:
         return self.metadata.get("media_type") == "video" and Path(self.transport_name).suffix.lower() == ".ts"
@@ -639,6 +679,12 @@ def parse_args() -> argparse.Namespace:
         help="How long to wait for more contiguous data before starting early with the current contiguous buffer.",
     )
     parser.add_argument(
+        "--playback-gap-skip-ms",
+        type=int,
+        default=200,
+        help="If playback is blocked by a missing chunk for this long, skip the gap and continue live playback. Set 0 to disable.",
+    )
+    parser.add_argument(
         "--playback-rewind-kb",
         type=int,
         default=4096,
@@ -666,6 +712,7 @@ def create_session(
     playback_buffer_kb: int,
     playback_min_start_kb: int,
     playback_start_timeout_ms: int,
+    playback_gap_skip_ms: int,
     playback_rewind_kb: int,
     playback_no_display: bool,
 ) -> SessionState:
@@ -720,6 +767,7 @@ def create_session(
         playback_disabled_reason=playback_disabled_reason,
         playback_min_start_bytes=max(playback_min_start_kb, 0) * 1024,
         playback_start_timeout=max(playback_start_timeout_ms, 0) / 1000.0,
+        playback_gap_skip_timeout=max(playback_gap_skip_ms, 0) / 1000.0,
     )
 
 
@@ -835,6 +883,7 @@ def main() -> int:
                             playback_buffer_kb=args.playback_buffer_kb,
                             playback_min_start_kb=args.playback_min_start_kb,
                             playback_start_timeout_ms=args.playback_start_timeout_ms,
+                            playback_gap_skip_ms=args.playback_gap_skip_ms,
                             playback_rewind_kb=args.playback_rewind_kb,
                             playback_no_display=args.playback_no_display,
                         )
@@ -906,6 +955,9 @@ def main() -> int:
                 for state in sessions.values():
                     print(state.progress_line(interval))
                 last_report = now
+    except KeyboardInterrupt:
+        print("Stopped     : receiver interrupted by user")
+        return 130
     finally:
         stop_event.set()
         try:

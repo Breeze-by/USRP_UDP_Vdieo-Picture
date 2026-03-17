@@ -32,6 +32,13 @@ pip install -r .\requirements.txt
 powershell -ExecutionPolicy Bypass -File .\setup_env.ps1
 ```
 
+如果 `.venv` 已经存在，脚本会直接复用它并更新依赖，不会重复重建。
+如果你明确需要重建环境：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_env.ps1 -Recreate
+```
+
 或者手工执行：
 
 ```powershell
@@ -97,25 +104,29 @@ python .\receiver.py --bind-host 127.0.0.1 --port 9000 --output-dir .\received -
 常用参数：
 
 - `--live-play` / `--no-live-play`：是否启用实时播放，默认开启。
-- `--playback-buffer-kb 2048`：起播前缓存大小；小一些起播更快，大一些更稳。
+- `--playback-buffer-kb 1024`：理想起播前的连续缓存大小；大一些更稳。
+- `--playback-min-start-kb 256`：如果连续数据提前卡住，允许用这部分连续缓存提前起播。
+- `--playback-start-timeout-ms 1000`：连续数据迟迟接不上时，等多久后按当前连续缓存提前起播。
 - `--playback-rewind-kb 4096`：关闭播放窗口后自动重启时可回放的最近缓存。
 - `--idle-timeout 5`：超过多久没收到新数据就判定会话超时。
 - `--auto-remux` / `--no-auto-remux`：接收完成后是否自动还原回原始容器。
+- `--packet-queue-size 8192`：接收端用户态收包队列，抗突发更强。
 
 接收端日志会显示：
 
 - 当前接收进度
 - 实时接收吞吐率 `rx`
-- 实时送入播放器的数据率 `play`
+- 实时送入连续播放缓冲的数据率 `feed`
 - 当前缓存大小 `buffer`
 - 已连续可播放到的分片位置 `ready`
+- 如果出现 `wait N`，表示正在等第 `N` 个 chunk，后面的数据虽然收到了，但还不能继续播放
 
 ## 8 MB/s 调参建议
 
 如果你的目标是约 `8 MB/s` 有效载荷吞吐率，建议先这样测：
 
 ```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --no-live-play --socket-buffer-kb 16384
+python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --no-live-play --socket-buffer-kb 32768
 python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000 --target-rate-mbps 8 --chunk-size 1316
 ```
 
@@ -125,6 +136,7 @@ python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000 --targe
 - 纯接收稳定后，再打开实时播放看解码显示会不会拖慢
 - 如果还不够，再尝试 `--chunk-size 1400`
 - 如果只是做吞吐测试，可临时加 `--control-repeat 1 --control-interval-ms 0`，减少短文件测试里的控制包固定开销
+- 如果接收端日志里长期停在 `wait 749` 这类位置，说明前面某个 chunk 没收到，播放会严格卡在那个位置等待
 
 说明：
 
@@ -136,7 +148,7 @@ python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000 --targe
 先启动接收端：
 
 ```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --playback-buffer-kb 2048
+python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --playback-buffer-kb 1024
 ```
 
 再启动发送端：

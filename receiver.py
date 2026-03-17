@@ -142,6 +142,17 @@ class LivePlayer:
             byte_stream = self.byte_stream
             return self.pending_bytes + (byte_stream.buffered_bytes() if byte_stream is not None else 0)
 
+    def is_running(self) -> bool:
+        with self.lock:
+            return self.playback_thread is not None and self.playback_thread.is_alive()
+
+    def force_start(self) -> bool:
+        with self.lock:
+            if self.playback_thread is not None or self.pending_bytes <= 0:
+                return False
+            self._maybe_start_locked(time.monotonic(), force=True)
+            return self.playback_thread is not None
+
     def finish(self) -> None:
         with self.lock:
             self.stop_requested = True
@@ -225,10 +236,14 @@ class LivePlayer:
         self.stop_signal = stop_signal
         self.playback_thread = playback_thread
 
+        startup_bytes = self.pending_bytes
+        if not force:
+            startup_bytes = max(self.startup_threshold, self.pending_bytes)
+
         if self.restart_pending_reason is None:
             self.events.put(
                 f"Playback    : session {self.session_id:016x} started, "
-                f"startup buffer {format_bytes(max(self.startup_threshold, self.pending_bytes))}"
+                f"startup buffer {format_bytes(startup_bytes)}"
             )
         else:
             self.restart_count += 1
@@ -356,10 +371,15 @@ class SessionState:
     playback_pending_bytes: int = 0
     next_playback_chunk: int = 0
     end_received: bool = False
+    playback_min_start_bytes: int = 256 * 1024
+    playback_start_timeout: float = 1.0
     last_activity: float = field(default_factory=time.monotonic)
     last_flush: float = field(default_factory=time.monotonic)
     last_report_rx_bytes: int = 0
-    last_report_play_bytes: int = 0
+    last_report_feed_bytes: int = 0
+    last_ready_advance: float = field(default_factory=time.monotonic)
+    last_wait_report_chunk: int = -1
+    last_wait_report_at: float = 0.0
 
     def handle_data(self, chunk_id: int, payload: bytes) -> None:
         if chunk_id >= self.total_chunks:
@@ -389,13 +409,14 @@ class SessionState:
         messages = self.live_player.service()
         self._drain_live_stream()
         messages.extend(self.live_player.service())
+        messages.extend(self._service_playback_waiting())
         return messages
 
     def progress_line(self, interval: float) -> str:
         rx_delta = self.received_payload_bytes - self.last_report_rx_bytes
-        play_delta = self.playback_bytes_emitted - self.last_report_play_bytes
+        feed_delta = self.playback_bytes_emitted - self.last_report_feed_bytes
         self.last_report_rx_bytes = self.received_payload_bytes
-        self.last_report_play_bytes = self.playback_bytes_emitted
+        self.last_report_feed_bytes = self.playback_bytes_emitted
 
         progress = self.chunks_received / self.total_chunks * 100.0 if self.total_chunks else 100.0
         line = (
@@ -404,11 +425,15 @@ class SessionState:
             f"rx {format_bytes(rx_delta / interval if interval > 0 else 0.0)}/s"
         )
         if self.live_player is not None:
+            state = "playing" if self.live_player.is_running() else "buffering"
             line += (
-                f", play {format_bytes(play_delta / interval if interval > 0 else 0.0)}/s, "
+                f", feed {format_bytes(feed_delta / interval if interval > 0 else 0.0)}/s, "
                 f"buffer {format_bytes(self.live_buffer_bytes())}, "
-                f"ready {self.next_playback_chunk}/{self.total_chunks}"
+                f"ready {self.next_playback_chunk}/{self.total_chunks}, "
+                f"state {state}"
             )
+            if self.chunks_received > self.next_playback_chunk:
+                line += f", wait {self.next_playback_chunk}"
         return line
 
     def live_buffer_bytes(self) -> int:
@@ -517,6 +542,7 @@ class SessionState:
         if self.live_player is None:
             return
 
+        advanced = False
         while True:
             payload = self.playback_pending.pop(self.next_playback_chunk, None)
             if payload is None:
@@ -525,6 +551,48 @@ class SessionState:
             self.live_player.feed(payload)
             self.playback_bytes_emitted += len(payload)
             self.next_playback_chunk += 1
+            advanced = True
+        if advanced:
+            self.last_ready_advance = time.monotonic()
+
+    def _service_playback_waiting(self) -> list[str]:
+        if self.live_player is None:
+            return []
+
+        messages: list[str] = []
+        now = time.monotonic()
+        buffered = self.live_player.buffered_bytes()
+        stalled = now - self.last_ready_advance
+
+        if (
+            not self.live_player.is_running()
+            and self.next_playback_chunk > 0
+            and buffered >= self.playback_min_start_bytes
+            and stalled >= self.playback_start_timeout
+        ):
+            if self.live_player.force_start():
+                messages.append(
+                    f"Playback    : session {self.session_id:016x} starting early with "
+                    f"{format_bytes(buffered)} contiguous data after waiting {stalled:.1f}s"
+                )
+                messages.extend(self.live_player.service())
+
+        if (
+            self.chunks_received > self.next_playback_chunk
+            and stalled >= 1.0
+            and (
+                self.last_wait_report_chunk != self.next_playback_chunk
+                or now - self.last_wait_report_at >= 5.0
+            )
+        ):
+            messages.append(
+                f"Playback    : session {self.session_id:016x} waiting for chunk "
+                f"{self.next_playback_chunk} before playback can continue"
+            )
+            self.last_wait_report_chunk = self.next_playback_chunk
+            self.last_wait_report_at = now
+
+        return messages
 
     def _is_ts_transport(self) -> bool:
         return self.metadata.get("media_type") == "video" and Path(self.transport_name).suffix.lower() == ".ts"
@@ -538,7 +606,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", required=True, type=int, help="Local UDP port to listen on.")
     parser.add_argument("--output-dir", default="received", help="Directory for reconstructed files.")
     parser.add_argument("--idle-timeout", type=float, default=5.0, help="Seconds of silence before timing out a session.")
-    parser.add_argument("--socket-buffer-kb", type=int, default=16384, help="Socket receive buffer in KiB.")
+    parser.add_argument("--socket-buffer-kb", type=int, default=32768, help="Socket receive buffer in KiB.")
+    parser.add_argument(
+        "--packet-queue-size",
+        type=int,
+        default=8192,
+        help="Number of UDP packets buffered in userspace before processing.",
+    )
     parser.add_argument("--once", action="store_true", help="Exit after one successful session.")
     parser.add_argument(
         "--live-play",
@@ -549,8 +623,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--playback-buffer-kb",
         type=int,
-        default=2048,
+        default=1024,
         help="Contiguous TS data to buffer before starting live playback.",
+    )
+    parser.add_argument(
+        "--playback-min-start-kb",
+        type=int,
+        default=256,
+        help="If contiguous data stalls before reaching --playback-buffer-kb, allow an early start from this much buffered data.",
+    )
+    parser.add_argument(
+        "--playback-start-timeout-ms",
+        type=int,
+        default=1000,
+        help="How long to wait for more contiguous data before starting early with the current contiguous buffer.",
     )
     parser.add_argument(
         "--playback-rewind-kb",
@@ -578,6 +664,8 @@ def create_session(
     metadata: dict,
     live_play: bool,
     playback_buffer_kb: int,
+    playback_min_start_kb: int,
+    playback_start_timeout_ms: int,
     playback_rewind_kb: int,
     playback_no_display: bool,
 ) -> SessionState:
@@ -630,7 +718,30 @@ def create_session(
         received=bytearray(total_chunks),
         live_player=live_player,
         playback_disabled_reason=playback_disabled_reason,
+        playback_min_start_bytes=max(playback_min_start_kb, 0) * 1024,
+        playback_start_timeout=max(playback_start_timeout_ms, 0) / 1000.0,
     )
+
+
+def socket_reader(
+    sock: socket.socket,
+    packet_queue: queue.Queue[tuple[bytes, tuple[str, int]]],
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            packet, peer = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        while not stop_event.is_set():
+            try:
+                packet_queue.put((packet, peer), timeout=0.1)
+                break
+            except queue.Full:
+                continue
 
 
 def finalize_session(state: SessionState, auto_remux: bool) -> None:
@@ -643,7 +754,7 @@ def finalize_session(state: SessionState, auto_remux: bool) -> None:
     print(f"Size        : {format_bytes(state.transport_size)}")
     if state.live_player is not None:
         print(
-            f"Playback    : fed {format_bytes(state.playback_bytes_emitted)} to player, "
+            f"Playback    : fed {format_bytes(state.playback_bytes_emitted)} contiguous data, "
             f"ready {state.next_playback_chunk}/{state.total_chunks}"
         )
 
@@ -654,9 +765,11 @@ def close_incomplete_session(state: SessionState, reason: str) -> None:
     print(f"Chunks      : {state.chunks_received}/{state.total_chunks}")
     if state.live_player is not None:
         print(
-            f"Playback    : fed {format_bytes(state.playback_bytes_emitted)} to player, "
+            f"Playback    : fed {format_bytes(state.playback_bytes_emitted)} contiguous data, "
             f"ready {state.next_playback_chunk}/{state.total_chunks}"
         )
+        if state.next_playback_chunk < state.total_chunks:
+            print(f"Playback    : first missing chunk for playback was {state.next_playback_chunk}")
 
 
 def main() -> int:
@@ -677,19 +790,32 @@ def main() -> int:
         raise
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, args.socket_buffer_kb * 1024)
     sock.settimeout(0.5)
+    actual_socket_buffer = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    packet_queue: queue.Queue[tuple[bytes, tuple[str, int]]] = queue.Queue(maxsize=max(args.packet_queue_size, 1))
+    stop_event = threading.Event()
+    reader_thread = threading.Thread(
+        target=socket_reader,
+        args=(sock, packet_queue, stop_event),
+        name="udp-recv",
+        daemon=True,
+    )
+    reader_thread.start()
 
     sessions: dict[int, SessionState] = {}
     last_report = time.monotonic()
 
     print(f"Listening   : {args.bind_host}:{args.port}")
     print(f"Output dir  : {output_dir}")
+    print(f"Socket buf  : requested {format_bytes(args.socket_buffer_kb * 1024)}, actual {format_bytes(actual_socket_buffer)}")
+    print(f"Queue size  : {args.packet_queue_size} packets")
 
     try:
         while True:
             try:
-                packet, peer = sock.recvfrom(65535)
-            except socket.timeout:
+                packet, peer = packet_queue.get(timeout=0.1)
+            except queue.Empty:
                 packet = None
+                peer = ("", 0)
 
             now = time.monotonic()
             if packet is not None:
@@ -707,6 +833,8 @@ def main() -> int:
                             metadata=metadata,
                             live_play=args.live_play,
                             playback_buffer_kb=args.playback_buffer_kb,
+                            playback_min_start_kb=args.playback_min_start_kb,
+                            playback_start_timeout_ms=args.playback_start_timeout_ms,
                             playback_rewind_kb=args.playback_rewind_kb,
                             playback_no_display=args.playback_no_display,
                         )
@@ -779,9 +907,14 @@ def main() -> int:
                     print(state.progress_line(interval))
                 last_report = now
     finally:
+        stop_event.set()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        reader_thread.join(timeout=1.0)
         for state in sessions.values():
             state.abort()
-        sock.close()
 
 
 if __name__ == "__main__":

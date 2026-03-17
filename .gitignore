@@ -1,0 +1,4 @@
+*.mp4
+received/
+.vscode/
+__pycache__/

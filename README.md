@@ -74,13 +74,13 @@ ffmpeg -version
 发送图片：
 
 ```powershell
-python .\sender.py --input ".\图片.jpg" --host 192.168.10.2 --port 6000
+python .\sender.py --input ".\input.jpg" --host 192.168.10.2 --port 6000
 ```
 
 发送视频：
 
 ```powershell
-python .\sender.py --input ".\视频.mp4" --host 192.168.10.2 --port 6000
+python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000
 ```
 
 常用参数：
@@ -128,7 +128,7 @@ python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received
 
 ```powershell
 python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --playback-buffer-kb 2048
-python .\sender.py --input ".\视频.mp4" --host 192.168.10.2 --port 6000
+python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000
 ```
 
 如果你想更快起播，可以把缓存调小：
@@ -166,7 +166,7 @@ python .\receiver.py --port 9000 --output-dir .\received --once --playback-no-di
 再在另一个终端发送：
 
 ```powershell
-python .\sender.py --input ".\图片.jpg" --host 127.0.0.1 --port 9000
+python .\sender.py --input ".\input.jpg" --host 127.0.0.1 --port 9000
 ```
 
 ## 和 USRP 对接时的建议

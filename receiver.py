@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import queue
-import shutil
 import socket
 import subprocess
 import threading
@@ -13,9 +12,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
+import av
+import cv2
+
 from usrp_udp.common import (
     compute_sha256,
     format_bytes,
+    get_ffmpeg_executable,
     infer_chunk_length,
     loads_json,
     safe_filename,
@@ -26,26 +29,77 @@ from usrp_udp.protocol import PacketKind, parse_packet
 TS_PACKET_SIZE = 188
 
 
+class BlockingByteStream:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._closed = False
+        self._condition = threading.Condition()
+
+    def write(self, payload: bytes) -> None:
+        if not payload:
+            return
+        with self._condition:
+            if self._closed:
+                return
+            self._buffer.extend(payload)
+            self._condition.notify_all()
+
+    def read(self, size: int = -1) -> bytes:
+        with self._condition:
+            while not self._buffer and not self._closed:
+                self._condition.wait(timeout=0.1)
+            if not self._buffer:
+                return b""
+            if size is None or size < 0 or size > len(self._buffer):
+                size = len(self._buffer)
+            payload = bytes(self._buffer[:size])
+            del self._buffer[:size]
+            return payload
+
+    def buffered_bytes(self) -> int:
+        with self._condition:
+            return len(self._buffer)
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        raise OSError("stream is not seekable")
+
+    def tell(self) -> int:
+        return 0
+
+
 @dataclass(slots=True)
 class LivePlayer:
     session_id: int
     transport_name: str
-    executable: str
     startup_threshold: int
     replay_buffer_limit: int
     restart_delay: float
     no_display: bool = False
-    process: subprocess.Popen[bytes] | None = None
-    writer_thread: threading.Thread | None = None
-    current_queue: queue.SimpleQueue[bytes | None] | None = None
+    playback_thread: threading.Thread | None = None
+    byte_stream: BlockingByteStream | None = None
+    stop_signal: threading.Event | None = None
     pending_chunks: deque[bytes] = field(default_factory=deque)
     replay_history: deque[bytes] = field(default_factory=deque)
     events: queue.SimpleQueue[str] = field(default_factory=queue.SimpleQueue)
     lock: threading.Lock = field(default_factory=threading.Lock)
     pending_bytes: int = 0
-    queued_bytes: int = 0
     replay_history_bytes: int = 0
     restart_pending_reason: str | None = None
+    last_exit_reason: str | None = None
     restart_count: int = 0
     stop_requested: bool = False
     last_start_attempt: float = 0.0
@@ -55,20 +109,19 @@ class LivePlayer:
             return
 
         now = time.monotonic()
+        byte_stream: BlockingByteStream | None = None
         with self.lock:
             self._service_locked(now)
             self._append_replay_locked(payload)
-            if self.process is None:
+            if self.playback_thread is None:
                 self.pending_chunks.append(payload)
                 self.pending_bytes += len(payload)
                 self._maybe_start_locked(now)
                 return
-            queue_obj = self.current_queue
-            if queue_obj is not None:
-                self.queued_bytes += len(payload)
+            byte_stream = self.byte_stream
 
-        if queue_obj is not None:
-            queue_obj.put(payload)
+        if byte_stream is not None:
+            byte_stream.write(payload)
 
     def service(self) -> list[str]:
         with self.lock:
@@ -86,57 +139,40 @@ class LivePlayer:
 
     def buffered_bytes(self) -> int:
         with self.lock:
-            return self.pending_bytes + self.queued_bytes
+            byte_stream = self.byte_stream
+            return self.pending_bytes + (byte_stream.buffered_bytes() if byte_stream is not None else 0)
 
     def finish(self) -> None:
         with self.lock:
             self.stop_requested = True
             now = time.monotonic()
             self._service_locked(now)
-            if self.process is None and self.pending_bytes > 0:
+            if self.playback_thread is None and self.pending_bytes > 0:
                 self._maybe_start_locked(now, force=True)
-            queue_obj = self.current_queue
-            writer_thread = self.writer_thread
-            process = self.process
-            self.queued_bytes = 0
+            byte_stream = self.byte_stream
+            playback_thread = self.playback_thread
 
-        if queue_obj is not None:
-            queue_obj.put(None)
-        if writer_thread is not None:
-            writer_thread.join(timeout=5.0)
-        if process is not None:
-            try:
-                process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2.0)
+        if byte_stream is not None:
+            byte_stream.close()
+        if playback_thread is not None:
+            playback_thread.join(timeout=5.0)
 
     def terminate(self) -> None:
         with self.lock:
             self.stop_requested = True
-            queue_obj = self.current_queue
-            writer_thread = self.writer_thread
-            process = self.process
-            self.current_queue = None
-            self.writer_thread = None
-            self.process = None
-            self.queued_bytes = 0
+            stop_signal = self.stop_signal
+            byte_stream = self.byte_stream
+            playback_thread = self.playback_thread
+            self.stop_signal = None
+            self.byte_stream = None
+            self.playback_thread = None
 
-        if queue_obj is not None:
-            queue_obj.put(None)
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2.0)
-        if writer_thread is not None:
-            writer_thread.join(timeout=1.0)
+        if stop_signal is not None:
+            stop_signal.set()
+        if byte_stream is not None:
+            byte_stream.close()
+        if playback_thread is not None:
+            playback_thread.join(timeout=1.0)
 
     def _append_replay_locked(self, payload: bytes) -> None:
         self.replay_history.append(payload)
@@ -146,19 +182,18 @@ class LivePlayer:
             self.replay_history_bytes -= len(dropped)
 
     def _service_locked(self, now: float) -> None:
-        if self.process is None or self.process.poll() is None:
+        if self.playback_thread is None or self.playback_thread.is_alive():
             return
 
-        reason = f"ffplay exited with code {self.process.returncode}"
-        self.current_queue = None
-        self.writer_thread = None
-        self.process = None
+        reason = self.last_exit_reason or "player thread exited"
+        self.stop_signal = None
+        self.byte_stream = None
+        self.playback_thread = None
         if self.stop_requested:
             return
 
         self.pending_chunks = deque(self.replay_history)
         self.pending_bytes = self.replay_history_bytes
-        self.queued_bytes = 0
         self.restart_pending_reason = reason
         self.events.put(
             f"Playback    : session {self.session_id:016x} player stopped ({reason}), "
@@ -167,7 +202,7 @@ class LivePlayer:
         self._maybe_start_locked(now)
 
     def _maybe_start_locked(self, now: float, force: bool = False) -> None:
-        if self.stop_requested or self.process is not None:
+        if self.playback_thread is not None or (self.stop_requested and not force):
             return
         if not force and self.pending_bytes < self.startup_threshold:
             return
@@ -175,55 +210,20 @@ class LivePlayer:
             return
 
         self.last_start_attempt = now
-
-        command = [
-            self.executable,
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-window_title",
-            f"USRP UDP Live {self.transport_name}",
-        ]
-        if self.no_display:
-            command.append("-nodisp")
-        command.extend(
-            [
-                "-autoexit",
-                "-probesize",
-                "32",
-                "-analyzeduration",
-                "0",
-                "-f",
-                "mpegts",
-                "-i",
-                "pipe:0",
-            ]
-        )
-
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
-        except OSError as exc:
-            self.events.put(f"Playback    : session {self.session_id:016x} failed to start ffplay ({exc})")
-            return
-
-        queue_obj: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
-        writer_thread = threading.Thread(
-            target=self._writer_loop,
-            args=(process, queue_obj),
+        byte_stream = BlockingByteStream()
+        stop_signal = threading.Event()
+        playback_thread = threading.Thread(
+            target=self._playback_loop,
+            args=(byte_stream, stop_signal),
             name=f"live-player-{self.session_id:016x}",
             daemon=True,
         )
-        writer_thread.start()
+        playback_thread.start()
 
-        self.process = process
-        self.current_queue = queue_obj
-        self.writer_thread = writer_thread
+        self.last_exit_reason = None
+        self.byte_stream = byte_stream
+        self.stop_signal = stop_signal
+        self.playback_thread = playback_thread
 
         if self.restart_pending_reason is None:
             self.events.put(
@@ -240,32 +240,96 @@ class LivePlayer:
 
         while self.pending_chunks:
             payload = self.pending_chunks.popleft()
-            self.queued_bytes += len(payload)
-            queue_obj.put(payload)
+            byte_stream.write(payload)
         self.pending_bytes = 0
 
-    def _writer_loop(self, process: subprocess.Popen[bytes], write_queue: queue.SimpleQueue[bytes | None]) -> None:
-        if process.stdin is None:
+    def _playback_loop(self, byte_stream: BlockingByteStream, stop_signal: threading.Event) -> None:
+        window_name = f"USRP UDP Live {self.transport_name}"
+        exit_reason = "stream ended"
+        try:
+            container = av.open(byte_stream, mode="r", format="mpegts")
+        except Exception as exc:
+            exit_reason = f"decoder init failed ({exc})"
+            with self.lock:
+                self.last_exit_reason = exit_reason
             return
 
         try:
-            while True:
-                payload = write_queue.get()
-                if payload is None:
+            video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+            if video_stream is None:
+                exit_reason = "no video stream"
+                return
+
+            frame_interval = 0.0
+            if video_stream.average_rate is not None:
+                try:
+                    frame_interval = float(video_stream.average_rate.denominator / video_stream.average_rate.numerator)
+                except ZeroDivisionError:
+                    frame_interval = 0.0
+
+            if not self.no_display:
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+            start_wall: float | None = None
+            start_media: float | None = None
+            last_media = 0.0
+
+            for frame in container.decode(video=0):
+                if stop_signal.is_set():
+                    exit_reason = "stopped"
                     break
-                if process.poll() is not None:
+
+                frame_time = frame.time
+                if frame_time is None:
+                    if start_media is None:
+                        frame_time = 0.0
+                    else:
+                        frame_time = last_media + frame_interval
+                media_time = max(float(frame_time), 0.0)
+
+                if start_wall is None:
+                    start_wall = time.perf_counter()
+                    start_media = media_time
+
+                target_time = start_wall + (media_time - start_media)
+                while True:
+                    delay = target_time - time.perf_counter()
+                    if delay <= 0:
+                        break
+                    if stop_signal.is_set():
+                        exit_reason = "stopped"
+                        break
+                    time.sleep(min(delay, 0.01))
+                if stop_signal.is_set():
+                    exit_reason = "stopped"
                     break
-                process.stdin.write(payload)
-                process.stdin.flush()
-                with self.lock:
-                    self.queued_bytes = max(0, self.queued_bytes - len(payload))
-        except (BrokenPipeError, OSError):
-            pass
+
+                last_media = media_time
+                if self.no_display:
+                    continue
+
+                image = frame.to_ndarray(format="bgr24")
+                cv2.imshow(window_name, image)
+                cv2.waitKey(1)
+                visible = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
+                if visible < 1:
+                    exit_reason = "window closed by user"
+                    break
+        except Exception as exc:
+            exit_reason = f"decoder error ({exc})"
         finally:
             try:
-                process.stdin.close()
-            except OSError:
+                container.close()
+            except Exception:
                 pass
+            if not self.no_display:
+                try:
+                    cv2.destroyWindow(window_name)
+                    cv2.waitKey(1)
+                except Exception:
+                    pass
+            with self.lock:
+                self.last_exit_reason = exit_reason
 
 
 @dataclass(slots=True)
@@ -382,7 +446,7 @@ class SessionState:
         restored_path: Path | None = None
         restore_hint = self.metadata.get("restore_hint")
         if auto_remux and restore_hint and restore_hint.get("type") == "ffmpeg_remux":
-            ffmpeg = shutil.which("ffmpeg")
+            ffmpeg = get_ffmpeg_executable()
             target_name = safe_filename(restore_hint.get("target_name", self.original_name))
             if ffmpeg:
                 candidate = self.session_dir / target_name
@@ -480,7 +544,7 @@ def parse_args() -> argparse.Namespace:
         "--live-play",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Automatically start ffplay for incoming MPEG-TS video once the startup buffer is filled.",
+        help="Automatically start the built-in Python live player for incoming MPEG-TS video once the startup buffer is filled.",
     )
     parser.add_argument(
         "--playback-buffer-kb",
@@ -492,18 +556,18 @@ def parse_args() -> argparse.Namespace:
         "--playback-rewind-kb",
         type=int,
         default=4096,
-        help="Recent live data kept for automatic ffplay restart after the player is closed.",
+        help="Recent live data kept for automatic player restart after the playback window is closed.",
     )
     parser.add_argument(
         "--playback-no-display",
         action="store_true",
-        help="Start ffplay in no-display mode. Useful for headless testing.",
+        help="Decode in real time without opening a playback window. Useful for headless testing.",
     )
     parser.add_argument(
         "--auto-remux",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="If the sender used MPEG-TS preprocessing and ffmpeg is available, restore the original container.",
+        help="If the sender used MPEG-TS preprocessing and packaged ffmpeg is available, restore the original container.",
     )
     return parser.parse_args()
 
@@ -531,19 +595,14 @@ def create_session(
     is_ts_video = metadata.get("media_type") == "video" and Path(transport_name).suffix.lower() == ".ts"
     chunk_size = int(metadata["chunk_size"])
     if live_play and is_ts_video:
-        executable = shutil.which("ffplay")
-        if executable is None:
-            playback_disabled_reason = "ffplay not found"
-        else:
-            live_player = LivePlayer(
-                session_id=session_id,
-                transport_name=transport_name,
-                executable=executable,
-                startup_threshold=max(playback_buffer_kb, 0) * 1024,
-                replay_buffer_limit=max(playback_rewind_kb, 0) * 1024,
-                restart_delay=0.5,
-                no_display=playback_no_display,
-            )
+        live_player = LivePlayer(
+            session_id=session_id,
+            transport_name=transport_name,
+            startup_threshold=max(playback_buffer_kb, 0) * 1024,
+            replay_buffer_limit=max(playback_rewind_kb, 0) * 1024,
+            restart_delay=0.5,
+            no_display=playback_no_display,
+        )
     elif live_play and metadata.get("media_type") == "video":
         playback_disabled_reason = "live playback requires MPEG-TS transport; keep sender --streamable-ts enabled"
 

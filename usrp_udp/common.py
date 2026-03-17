@@ -4,7 +4,6 @@ import hashlib
 import json
 import mimetypes
 import re
-import shutil
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
@@ -107,6 +106,18 @@ def loads_json(payload: bytes) -> dict:
     return json.loads(payload.decode("utf-8"))
 
 
+def get_ffmpeg_executable() -> str | None:
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+    except ImportError:
+        return None
+
+    try:
+        return get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
 def prepare_media(
     input_path: Path,
     prefer_streamable_video: bool,
@@ -120,7 +131,7 @@ def prepare_media(
     restore_hint = None
 
     if media_type == "video" and prefer_streamable_video and input_path.suffix.lower() != ".ts":
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = get_ffmpeg_executable()
         if ffmpeg:
             temp_dir = tempfile.TemporaryDirectory(prefix="usrp_udp_")
             candidate = Path(temp_dir.name) / f"{input_path.stem}_stream.ts"

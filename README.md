@@ -68,7 +68,8 @@ python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000
 常用参数：
 
 - `--chunk-size 1316`：每个 UDP 数据包负载大小，默认 `1316`，适合 MPEG-TS。
-- `--packet-interval-us 200`：发包间隔，链路容易拥塞时可适当调大。
+- `--target-rate-mbps 8`：按目标有效载荷吞吐率发包，推荐直接用这个参数做速率控制。
+- `--packet-interval-us 200`：按固定包间隔发包；设置了 `--target-rate-mbps` 后会被忽略。
 - `--streamable-ts` / `--no-streamable-ts`：视频是否先转成 TS 再发送。
 
 发送端日志会显示：
@@ -108,6 +109,27 @@ python .\receiver.py --bind-host 127.0.0.1 --port 9000 --output-dir .\received -
 - 实时送入播放器的数据率 `play`
 - 当前缓存大小 `buffer`
 - 已连续可播放到的分片位置 `ready`
+
+## 8 MB/s 调参建议
+
+如果你的目标是约 `8 MB/s` 有效载荷吞吐率，建议先这样测：
+
+```powershell
+python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --no-live-play --socket-buffer-kb 16384
+python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000 --target-rate-mbps 8 --chunk-size 1316
+```
+
+建议顺序：
+
+- 先用 `--no-live-play` 测纯接收吞吐，确认网口和接收写盘能不能稳住 `8 MB/s`
+- 纯接收稳定后，再打开实时播放看解码显示会不会拖慢
+- 如果还不够，再尝试 `--chunk-size 1400`
+- 如果只是做吞吐测试，可临时加 `--control-repeat 1 --control-interval-ms 0`，减少短文件测试里的控制包固定开销
+
+说明：
+
+- `8 MB/s` 有效载荷大约对应 `64 Mb/s` 以上的链路负载，算上 UDP/IP/以太网开销会更高一点
+- 千兆网口基本没问题；百兆网口通常也还能试，但余量会小很多
 
 ## 典型流程
 

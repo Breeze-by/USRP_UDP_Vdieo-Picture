@@ -2,3 +2,5 @@
 received/
 .vscode/
 __pycache__/
+.venv/
+.venv_test/

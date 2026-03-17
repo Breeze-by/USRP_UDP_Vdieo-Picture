@@ -538,7 +538,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", required=True, type=int, help="Local UDP port to listen on.")
     parser.add_argument("--output-dir", default="received", help="Directory for reconstructed files.")
     parser.add_argument("--idle-timeout", type=float, default=5.0, help="Seconds of silence before timing out a session.")
-    parser.add_argument("--socket-buffer-kb", type=int, default=4096, help="Socket receive buffer in KiB.")
+    parser.add_argument("--socket-buffer-kb", type=int, default=16384, help="Socket receive buffer in KiB.")
     parser.add_argument("--once", action="store_true", help="Exit after one successful session.")
     parser.add_argument(
         "--live-play",

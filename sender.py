@@ -16,6 +16,38 @@ from usrp_udp.common import (
 from usrp_udp.protocol import PacketKind, build_packet
 
 
+def precise_sleep_until(deadline: float) -> None:
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        if remaining > 0.002:
+            time.sleep(remaining - 0.001)
+        elif remaining > 0.0002:
+            time.sleep(0)
+
+
+class PacketPacer:
+    def __init__(self, target_rate_bytes_per_sec: float | None, packet_interval_sec: float) -> None:
+        self.target_rate_bytes_per_sec = target_rate_bytes_per_sec
+        self.packet_interval_sec = packet_interval_sec
+        self.start_time = time.perf_counter()
+        self.sent_payload_bytes = 0
+        self.sent_packets = 0
+
+    def pace_after_send(self, payload_bytes: int) -> None:
+        if self.target_rate_bytes_per_sec and self.target_rate_bytes_per_sec > 0:
+            self.sent_payload_bytes += payload_bytes
+            deadline = self.start_time + (self.sent_payload_bytes / self.target_rate_bytes_per_sec)
+            precise_sleep_until(deadline)
+            return
+
+        if self.packet_interval_sec > 0:
+            self.sent_packets += 1
+            deadline = self.start_time + (self.sent_packets * self.packet_interval_sec)
+            precise_sleep_until(deadline)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Send an image or video to a USRP-facing UDP endpoint with framing and CRC."
@@ -35,7 +67,13 @@ def parse_args() -> argparse.Namespace:
         "--packet-interval-us",
         type=int,
         default=200,
-        help="Delay between UDP packets in microseconds.",
+        help="Delay between UDP packets in microseconds. Ignored when --target-rate-mbps is set.",
+    )
+    parser.add_argument(
+        "--target-rate-mbps",
+        type=float,
+        default=None,
+        help="Target payload throughput in MB/s. Example: 8.0 means about 8 MB/s payload.",
     )
     parser.add_argument(
         "--control-repeat",
@@ -58,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--socket-buffer-kb",
         type=int,
-        default=1024,
+        default=8192,
         help="Socket send buffer in KiB.",
     )
     return parser.parse_args()
@@ -88,6 +126,8 @@ def main() -> int:
 
     if args.chunk_size <= 0 or args.chunk_size > 1400:
         raise ValueError("--chunk-size must be between 1 and 1400")
+    if args.target_rate_mbps is not None and args.target_rate_mbps <= 0:
+        raise ValueError("--target-rate-mbps must be > 0")
 
     prepared, temp_dir = prepare_media(input_path, prefer_streamable_video=args.streamable_ts)
     transport_path = Path(prepared.transport_path)
@@ -103,6 +143,7 @@ def main() -> int:
     session_id = secrets.randbits(64)
     destination = (args.host, args.port)
     packet_interval = args.packet_interval_us / 1_000_000.0
+    target_rate_bytes_per_sec = args.target_rate_mbps * 1_000_000.0 if args.target_rate_mbps is not None else None
     total_chunks = metadata["total_chunks"]
 
     print(f"Input       : {input_path}")
@@ -113,6 +154,10 @@ def main() -> int:
     print(f"Chunks      : {total_chunks}")
     if prepared.streamable and args.chunk_size % 188 != 0:
         print("Warning     : chunk-size is not aligned to 188-byte TS packets; 1316 is preferred for MPEG-TS streaming")
+    if target_rate_bytes_per_sec is not None:
+        print(f"Target rate : {args.target_rate_mbps:.2f} MB/s payload")
+    else:
+        print(f"Packet gap  : {args.packet_interval_us} us")
     print(f"Target      : {args.host}:{args.port}")
     print(f"Session ID  : {session_id:016x}")
 
@@ -130,6 +175,10 @@ def main() -> int:
     sent_bytes = 0
     data_packets = 0
     control_packets = 0
+    pacer = PacketPacer(
+        target_rate_bytes_per_sec=target_rate_bytes_per_sec,
+        packet_interval_sec=packet_interval,
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -150,6 +199,7 @@ def main() -> int:
         sent_bytes += len(start_payload) * args.control_repeat
         control_packets += args.control_repeat
 
+        data_phase_start = time.perf_counter()
         with transport_path.open("rb") as handle:
             chunk_id = 0
             last_report = time.perf_counter()
@@ -171,8 +221,7 @@ def main() -> int:
                 sent_bytes += len(chunk)
                 data_packets += 1
                 chunk_id += 1
-                if packet_interval > 0:
-                    time.sleep(packet_interval)
+                pacer.pace_after_send(len(chunk))
 
                 now = time.perf_counter()
                 if now - last_report >= 1.0:
@@ -194,6 +243,7 @@ def main() -> int:
                     last_report = now
                     last_report_bytes = sent_bytes
                     last_report_packets = sent_packets
+        data_phase_end = time.perf_counter()
 
         send_control(
             sock,
@@ -213,13 +263,16 @@ def main() -> int:
             temp_dir.cleanup()
 
     elapsed = time.perf_counter() - start_time
-    rate = sent_bytes / elapsed if elapsed > 0 else 0.0
+    session_rate = sent_bytes / elapsed if elapsed > 0 else 0.0
     packet_rate = sent_packets / elapsed if elapsed > 0 else 0.0
+    data_elapsed = data_phase_end - data_phase_start if data_packets > 0 else 0.0
+    data_rate = transport_size / data_elapsed if data_elapsed > 0 else 0.0
     print(
         f"Finished    : data {data_packets}, control {control_packets}, "
         f"total {sent_packets} packets in {elapsed:.2f}s"
     )
-    print(f"Throughput  : {format_bytes(rate)}/s payload, {packet_rate:.0f} pkt/s")
+    print(f"Stream rate : {format_bytes(data_rate)}/s payload during DATA phase")
+    print(f"Throughput  : {format_bytes(session_rate)}/s payload overall, {packet_rate:.0f} pkt/s")
     return 0
 
 

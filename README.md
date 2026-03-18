@@ -63,13 +63,13 @@ pip install -r .\requirements.txt
 发送图片：
 
 ```powershell
-python .\sender.py --input ".\input.jpg" --host 192.168.10.2 --port 6000
+python .\sender.py --input ".\input.jpg" --host 169.254.46.237 --port 50000
 ```
 
 发送视频：
 
 ```powershell
-python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000
+python .\sender.py --input ".\input.mp4" --host 169.254.46.237 --port 50000
 ```
 
 常用参数：
@@ -92,7 +92,7 @@ python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000
 接收并实时播放视频：
 
 ```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received
+python .\receiver.py --bind-host 0.0.0.0 --port 60000 --output-dir .\received
 ```
 
 如果只是做本机自动测试，不想弹播放窗口：
@@ -128,8 +128,8 @@ python .\receiver.py --bind-host 127.0.0.1 --port 9000 --output-dir .\received -
 如果你的目标是约 `8 MB/s` 有效载荷吞吐率，建议先这样测：
 
 ```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --no-live-play --socket-buffer-kb 32768
-python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000 --target-rate-mbps 8 --chunk-size 1316
+python .\receiver.py --bind-host 0.0.0.0 --port 60000 --output-dir .\received --no-live-play --socket-buffer-kb 32768
+python .\sender.py --input ".\input.mp4" --host 169.254.46.237 --port 50000 --target-rate-mbps 8 --chunk-size 1316
 ```
 
 建议顺序：
@@ -150,13 +150,13 @@ python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000 --targe
 先启动接收端：
 
 ```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 6000 --output-dir .\received --playback-buffer-kb 1024
+python .\receiver.py --bind-host 0.0.0.0 --port 60000 --output-dir .\received --playback-buffer-kb 1024
 ```
 
 再启动发送端：
 
 ```powershell
-python .\sender.py --input ".\input.mp4" --host 192.168.10.2 --port 6000
+python .\sender.py --input ".\input.mp4" --host 169.254.46.237 --port 50000
 ```
 
 如果是本机回环测试，把发送端目标地址改成 `127.0.0.1`，端口与接收端保持一致。

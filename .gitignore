@@ -4,3 +4,5 @@ received/
 __pycache__/
 .venv/
 .venv_test/
+data/
+shared/

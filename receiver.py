@@ -1,651 +1,173 @@
 from __future__ import annotations
 
 import argparse
-import heapq
-import json
+import os
 import queue
 import socket
-import subprocess
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
-import av
-import cv2
-
 from usrp_udp.common import (
     compute_sha256,
     format_bytes,
-    get_ffmpeg_executable,
     infer_chunk_length,
     loads_json,
-    safe_filename,
+    resolve_output_path,
 )
 from usrp_udp.protocol import PacketKind, parse_packet
 
 
-TS_PACKET_SIZE = 188
+RECENT_SESSION_TTL = 10.0
 
 
-class BlockingByteStream:
-    def __init__(self) -> None:
-        self._buffer = bytearray()
-        self._closed = False
-        self._condition = threading.Condition()
-
-    def write(self, payload: bytes) -> None:
-        if not payload:
-            return
-        with self._condition:
-            if self._closed:
-                return
-            self._buffer.extend(payload)
-            self._condition.notify_all()
-
-    def read(self, size: int = -1) -> bytes:
-        with self._condition:
-            while not self._buffer and not self._closed:
-                self._condition.wait(timeout=0.1)
-            if not self._buffer:
-                return b""
-            if size is None or size < 0 or size > len(self._buffer):
-                size = len(self._buffer)
-            payload = bytes(self._buffer[:size])
-            del self._buffer[:size]
-            return payload
-
-    def buffered_bytes(self) -> int:
-        with self._condition:
-            return len(self._buffer)
-
-    def close(self) -> None:
-        with self._condition:
-            self._closed = True
-            self._condition.notify_all()
-
-    def readable(self) -> bool:
-        return True
-
-    def writable(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return False
-
-    def seek(self, offset: int, whence: int = 0) -> int:
-        raise OSError("stream is not seekable")
-
-    def tell(self) -> int:
-        return 0
-
-
-@dataclass(slots=True)
-class LivePlayer:
-    session_id: int
-    transport_name: str
-    startup_threshold: int
-    replay_buffer_limit: int
-    restart_delay: float
-    no_display: bool = False
-    playback_thread: threading.Thread | None = None
-    byte_stream: BlockingByteStream | None = None
-    stop_signal: threading.Event | None = None
-    pending_chunks: deque[bytes] = field(default_factory=deque)
-    replay_history: deque[bytes] = field(default_factory=deque)
-    events: queue.SimpleQueue[str] = field(default_factory=queue.SimpleQueue)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    pending_bytes: int = 0
-    replay_history_bytes: int = 0
-    restart_pending_reason: str | None = None
-    last_exit_reason: str | None = None
-    restart_count: int = 0
-    stop_requested: bool = False
-    last_start_attempt: float = 0.0
-
-    def feed(self, payload: bytes) -> None:
-        if not payload:
-            return
-
-        now = time.monotonic()
-        byte_stream: BlockingByteStream | None = None
-        with self.lock:
-            self._service_locked(now)
-            self._append_replay_locked(payload)
-            if self.playback_thread is None:
-                self.pending_chunks.append(payload)
-                self.pending_bytes += len(payload)
-                self._maybe_start_locked(now)
-                return
-            byte_stream = self.byte_stream
-
-        if byte_stream is not None:
-            byte_stream.write(payload)
-
-    def service(self) -> list[str]:
-        with self.lock:
-            now = time.monotonic()
-            self._service_locked(now)
-            self._maybe_start_locked(now)
-
-        messages: list[str] = []
-        while True:
-            try:
-                messages.append(self.events.get_nowait())
-            except queue.Empty:
-                break
-        return messages
-
-    def buffered_bytes(self) -> int:
-        with self.lock:
-            byte_stream = self.byte_stream
-            return self.pending_bytes + (byte_stream.buffered_bytes() if byte_stream is not None else 0)
-
-    def is_running(self) -> bool:
-        with self.lock:
-            return self.playback_thread is not None and self.playback_thread.is_alive()
-
-    def force_start(self) -> bool:
-        with self.lock:
-            if self.playback_thread is not None or self.pending_bytes <= 0:
-                return False
-            self._maybe_start_locked(time.monotonic(), force=True)
-            return self.playback_thread is not None
-
-    def finish(self) -> None:
-        with self.lock:
-            self.stop_requested = True
-            now = time.monotonic()
-            self._service_locked(now)
-            if self.playback_thread is None and self.pending_bytes > 0:
-                self._maybe_start_locked(now, force=True)
-            byte_stream = self.byte_stream
-            playback_thread = self.playback_thread
-
-        if byte_stream is not None:
-            byte_stream.close()
-        if playback_thread is not None:
-            playback_thread.join(timeout=5.0)
-
-    def terminate(self) -> None:
-        with self.lock:
-            self.stop_requested = True
-            stop_signal = self.stop_signal
-            byte_stream = self.byte_stream
-            playback_thread = self.playback_thread
-            self.stop_signal = None
-            self.byte_stream = None
-            self.playback_thread = None
-
-        if stop_signal is not None:
-            stop_signal.set()
-        if byte_stream is not None:
-            byte_stream.close()
-        if playback_thread is not None:
-            playback_thread.join(timeout=1.0)
-
-    def _append_replay_locked(self, payload: bytes) -> None:
-        self.replay_history.append(payload)
-        self.replay_history_bytes += len(payload)
-        while self.replay_history and self.replay_history_bytes > self.replay_buffer_limit:
-            dropped = self.replay_history.popleft()
-            self.replay_history_bytes -= len(dropped)
-
-    def _service_locked(self, now: float) -> None:
-        if self.playback_thread is None or self.playback_thread.is_alive():
-            return
-
-        reason = self.last_exit_reason or "player thread exited"
-        self.stop_signal = None
-        self.byte_stream = None
-        self.playback_thread = None
-        if self.stop_requested:
-            return
-
-        self.pending_chunks = deque(self.replay_history)
-        self.pending_bytes = self.replay_history_bytes
-        self.restart_pending_reason = reason
-        self.events.put(
-            f"Playback    : session {self.session_id:016x} player stopped ({reason}), "
-            f"rebuffering {format_bytes(self.pending_bytes)}"
-        )
-        self._maybe_start_locked(now)
-
-    def _maybe_start_locked(self, now: float, force: bool = False) -> None:
-        if self.playback_thread is not None or (self.stop_requested and not force):
-            return
-        if not force and self.pending_bytes < self.startup_threshold:
-            return
-        if now - self.last_start_attempt < self.restart_delay:
-            return
-
-        self.last_start_attempt = now
-        byte_stream = BlockingByteStream()
-        stop_signal = threading.Event()
-        playback_thread = threading.Thread(
-            target=self._playback_loop,
-            args=(byte_stream, stop_signal),
-            name=f"live-player-{self.session_id:016x}",
-            daemon=True,
-        )
-        playback_thread.start()
-
-        self.last_exit_reason = None
-        self.byte_stream = byte_stream
-        self.stop_signal = stop_signal
-        self.playback_thread = playback_thread
-
-        startup_bytes = self.pending_bytes
-        if not force:
-            startup_bytes = max(self.startup_threshold, self.pending_bytes)
-
-        if self.restart_pending_reason is None:
-            self.events.put(
-                f"Playback    : session {self.session_id:016x} started, "
-                f"startup buffer {format_bytes(startup_bytes)}"
-            )
-        else:
-            self.restart_count += 1
-            self.events.put(
-                f"Playback    : session {self.session_id:016x} restarted "
-                f"(count={self.restart_count}), replay {format_bytes(self.pending_bytes)}"
-            )
-            self.restart_pending_reason = None
-
-        while self.pending_chunks:
-            payload = self.pending_chunks.popleft()
-            byte_stream.write(payload)
-        self.pending_bytes = 0
-
-    def _playback_loop(self, byte_stream: BlockingByteStream, stop_signal: threading.Event) -> None:
-        window_name = f"USRP UDP Live {self.transport_name}"
-        exit_reason = "stream ended"
-        try:
-            container = av.open(byte_stream, mode="r", format="mpegts")
-        except Exception as exc:
-            exit_reason = f"decoder init failed ({exc})"
-            with self.lock:
-                self.last_exit_reason = exit_reason
-            return
-
-        try:
-            video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
-            if video_stream is None:
-                exit_reason = "no video stream"
-                return
-
-            frame_interval = 0.0
-            if video_stream.average_rate is not None:
-                try:
-                    frame_interval = float(video_stream.average_rate.denominator / video_stream.average_rate.numerator)
-                except ZeroDivisionError:
-                    frame_interval = 0.0
-
-            if not self.no_display:
-                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-            start_wall: float | None = None
-            start_media: float | None = None
-            last_media = 0.0
-
-            for frame in container.decode(video=0):
-                if stop_signal.is_set():
-                    exit_reason = "stopped"
-                    break
-
-                frame_time = frame.time
-                if frame_time is None:
-                    if start_media is None:
-                        frame_time = 0.0
-                    else:
-                        frame_time = last_media + frame_interval
-                media_time = max(float(frame_time), 0.0)
-
-                if start_wall is None:
-                    start_wall = time.perf_counter()
-                    start_media = media_time
-
-                target_time = start_wall + (media_time - start_media)
-                while True:
-                    delay = target_time - time.perf_counter()
-                    if delay <= 0:
-                        break
-                    if stop_signal.is_set():
-                        exit_reason = "stopped"
-                        break
-                    time.sleep(min(delay, 0.01))
-                if stop_signal.is_set():
-                    exit_reason = "stopped"
-                    break
-
-                last_media = media_time
-                if self.no_display:
-                    continue
-
-                image = frame.to_ndarray(format="bgr24")
-                cv2.imshow(window_name, image)
-                cv2.waitKey(1)
-                visible = cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE)
-                if visible < 1:
-                    exit_reason = "window closed by user"
-                    break
-        except Exception as exc:
-            exit_reason = f"decoder error ({exc})"
-        finally:
-            try:
-                container.close()
-            except Exception:
-                pass
-            if not self.no_display:
-                try:
-                    cv2.destroyWindow(window_name)
-                    cv2.waitKey(1)
-                except Exception:
-                    pass
-            with self.lock:
-                self.last_exit_reason = exit_reason
+def apply_modified_time(path: Path, modified_ns: int) -> None:
+    if modified_ns <= 0:
+        return
+    try:
+        os.utime(path, ns=(modified_ns, modified_ns))
+    except OSError:
+        pass
 
 
 @dataclass(slots=True)
 class SessionState:
     session_id: int
-    metadata: dict
-    session_dir: Path
-    transport_path: Path
-    manifest_path: Path
+    sequence_number: int
+    entry_type: str
+    relative_path: str
+    final_path: Path
+    partial_path: Path | None
     chunk_size: int
     total_chunks: int
-    transport_size: int
-    transport_sha256: str
-    transport_name: str
-    original_name: str
-    transport_fp: BinaryIO
+    content_size: int
+    content_sha256: str
+    modified_ns: int
+    output_fp: BinaryIO | None
     received: bytearray
-    live_player: LivePlayer | None = None
-    playback_disabled_reason: str | None = None
-    playback_pending: dict[int, bytes] = field(default_factory=dict)
-    playback_pending_order: list[int] = field(default_factory=list)
     chunks_received: int = 0
     received_payload_bytes: int = 0
-    playback_bytes_emitted: int = 0
-    playback_pending_bytes: int = 0
-    next_playback_chunk: int = 0
     end_received: bool = False
-    playback_min_start_bytes: int = 256 * 1024
-    playback_start_timeout: float = 1.0
-    playback_gap_skip_timeout: float = 0.5
-    playback_skipped_chunks: int = 0
+    end_received_at: float | None = None
     last_activity: float = field(default_factory=time.monotonic)
     last_flush: float = field(default_factory=time.monotonic)
     last_report_rx_bytes: int = 0
-    last_report_feed_bytes: int = 0
-    last_ready_advance: float = field(default_factory=time.monotonic)
-    last_wait_report_chunk: int = -1
-    last_wait_report_at: float = 0.0
 
     def handle_data(self, chunk_id: int, payload: bytes) -> None:
-        if chunk_id >= self.total_chunks:
+        if self.entry_type != "file":
             return
+        if chunk_id < 0 or chunk_id >= self.total_chunks:
+            return
+
         self.last_activity = time.monotonic()
         if self.received[chunk_id]:
             return
 
-        self._write_chunk(chunk_id, payload)
+        payload = self._normalize_chunk(chunk_id, payload)
+        if self.output_fp is None:
+            raise ValueError("file session has no writable handle")
+        self.output_fp.seek(chunk_id * self.chunk_size)
+        self.output_fp.write(payload)
+        self.received[chunk_id] = 1
+        self.chunks_received += 1
+        self.received_payload_bytes += len(payload)
+        self.maybe_flush()
 
     def mark_end(self) -> None:
+        now = time.monotonic()
         self.end_received = True
-        self.last_activity = time.monotonic()
+        self.end_received_at = now
+        self.last_activity = now
 
     def maybe_flush(self) -> None:
+        if self.output_fp is None:
+            return
         now = time.monotonic()
         if now - self.last_flush >= 0.5:
-            self.transport_fp.flush()
+            self.output_fp.flush()
             self.last_flush = now
 
     def is_complete(self) -> bool:
         return self.chunks_received == self.total_chunks
 
-    def service_live_playback(self) -> list[str]:
-        if self.live_player is None:
-            return []
-        messages = self.live_player.service()
-        self._drain_live_stream()
-        messages.extend(self.live_player.service())
-        messages.extend(self._service_playback_waiting())
-        return messages
+    def missing_chunks(self) -> int:
+        return self.total_chunks - self.chunks_received
 
     def progress_line(self, interval: float) -> str:
         rx_delta = self.received_payload_bytes - self.last_report_rx_bytes
-        feed_delta = self.playback_bytes_emitted - self.last_report_feed_bytes
         self.last_report_rx_bytes = self.received_payload_bytes
-        self.last_report_feed_bytes = self.playback_bytes_emitted
-
         progress = self.chunks_received / self.total_chunks * 100.0 if self.total_chunks else 100.0
-        line = (
-            f"Progress    : session {self.session_id:016x} "
+        return (
+            f"Progress    : seq {self.sequence_number} {self.relative_path} "
             f"{self.chunks_received}/{self.total_chunks} chunks ({progress:.1f}%), "
             f"rx {format_bytes(rx_delta / interval if interval > 0 else 0.0)}/s"
         )
-        if self.live_player is not None:
-            state = "playing" if self.live_player.is_running() else "buffering"
-            line += (
-                f", feed {format_bytes(feed_delta / interval if interval > 0 else 0.0)}/s, "
-                f"buffer {format_bytes(self.live_buffer_bytes())}, "
-                f"ready {self.next_playback_chunk}/{self.total_chunks}, "
-                f"state {state}"
-            )
-            if self.chunks_received > self.next_playback_chunk:
-                line += f", wait {self.next_playback_chunk}"
-            if self.playback_skipped_chunks > 0:
-                line += f", skipped {self.playback_skipped_chunks}"
-        return line
 
-    def live_buffer_bytes(self) -> int:
-        player_pending = self.live_player.buffered_bytes() if self.live_player is not None else 0
-        return self.playback_pending_bytes + player_pending
+    def finalize(self) -> Path:
+        if self.entry_type == "directory":
+            self.final_path.mkdir(parents=True, exist_ok=True)
+            apply_modified_time(self.final_path, self.modified_ns)
+            return self.final_path
 
-    def abort(self) -> None:
-        if self.live_player is not None:
-            self.live_player.terminate()
-        self.transport_fp.close()
+        if self.output_fp is not None:
+            self.output_fp.flush()
+            self.output_fp.close()
+            self.output_fp = None
+        if self.partial_path is None:
+            raise ValueError("file session has no partial path")
 
-    def close_partial(self, reason: str) -> None:
-        self._drain_live_stream()
-        self.transport_fp.flush()
-        self.transport_fp.close()
-        if self.live_player is not None:
-            self.live_player.finish()
-        self._write_manifest(completed=False, reason=reason)
-
-    def finalize(self, auto_remux: bool) -> tuple[Path, Path | None]:
-        self._drain_live_stream()
-        self.transport_fp.flush()
-        self.transport_fp.close()
-
-        if self.live_player is not None:
-            self.live_player.finish()
-
-        actual_sha256 = compute_sha256(self.transport_path)
-        if actual_sha256 != self.transport_sha256:
+        actual_sha256 = compute_sha256(self.partial_path)
+        if actual_sha256 != self.content_sha256:
             raise ValueError(
-                f"SHA256 mismatch for session {self.session_id:016x}: "
-                f"expected {self.transport_sha256}, got {actual_sha256}"
+                f"SHA256 mismatch for {self.relative_path}: "
+                f"expected {self.content_sha256}, got {actual_sha256}"
             )
 
-        restored_path: Path | None = None
-        restore_hint = self.metadata.get("restore_hint")
-        if auto_remux and restore_hint and restore_hint.get("type") == "ffmpeg_remux":
-            ffmpeg = get_ffmpeg_executable()
-            target_name = safe_filename(restore_hint.get("target_name", self.original_name))
-            if ffmpeg:
-                candidate = self.session_dir / target_name
-                command = [
-                    ffmpeg,
-                    "-y",
-                    "-i",
-                    str(self.transport_path),
-                    "-c",
-                    "copy",
-                    str(candidate),
-                ]
-                result = subprocess.run(
-                    command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                if result.returncode == 0 and candidate.exists() and candidate.stat().st_size > 0:
-                    restored_path = candidate
+        self.final_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(self.partial_path, self.final_path)
+        apply_modified_time(self.final_path, self.modified_ns)
+        return self.final_path
 
-        self._write_manifest(completed=True)
-        return self.transport_path, restored_path
-
-    def _write_manifest(self, completed: bool, reason: str | None = None) -> None:
-        manifest = {
-            **self.metadata,
-            "completed": completed,
-            "reason": reason,
-            "chunks_received": self.chunks_received,
-            "missing_chunks": self.total_chunks - self.chunks_received,
-            "playback_bytes_emitted": self.playback_bytes_emitted,
-            "playback_skipped_chunks": self.playback_skipped_chunks,
-        }
-        self.manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    def _write_chunk(self, chunk_id: int, payload: bytes) -> bytes:
-        payload = self._normalize_chunk(chunk_id, payload)
-        self.transport_fp.seek(chunk_id * self.chunk_size)
-        self.transport_fp.write(payload)
-        self.received[chunk_id] = 1
-        self.chunks_received += 1
-        self.received_payload_bytes += len(payload)
-        self._track_live_stream(chunk_id, payload)
-        self.maybe_flush()
-        return payload
+    def drop_partial(self) -> None:
+        if self.output_fp is not None:
+            self.output_fp.close()
+            self.output_fp = None
+        if self.partial_path is not None:
+            try:
+                self.partial_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _normalize_chunk(self, chunk_id: int, payload: bytes) -> bytes:
-        expected = infer_chunk_length(chunk_id, self.total_chunks, self.transport_size, self.chunk_size)
-        if len(payload) != expected:
-            if len(payload) > expected:
-                return payload[:expected]
-            return payload + b"\x00" * (expected - len(payload))
-        return payload
-
-    def _track_live_stream(self, chunk_id: int, payload: bytes) -> None:
-        if self.live_player is None or chunk_id < self.next_playback_chunk:
-            return
-        if chunk_id in self.playback_pending:
-            return
-        self.playback_pending[chunk_id] = payload
-        heapq.heappush(self.playback_pending_order, chunk_id)
-        self.playback_pending_bytes += len(payload)
-        self._drain_live_stream()
-
-    def _drain_live_stream(self) -> None:
-        if self.live_player is None:
-            return
-
-        advanced = False
-        while True:
-            payload = self.playback_pending.pop(self.next_playback_chunk, None)
-            if payload is None:
-                break
-            self.playback_pending_bytes -= len(payload)
-            self.live_player.feed(payload)
-            self.playback_bytes_emitted += len(payload)
-            self.next_playback_chunk += 1
-            advanced = True
-        if advanced:
-            self.last_ready_advance = time.monotonic()
-        self._discard_stale_pending_order()
-
-    def _service_playback_waiting(self) -> list[str]:
-        if self.live_player is None:
-            return []
-
-        messages: list[str] = []
-        now = time.monotonic()
-        buffered = self.live_player.buffered_bytes()
-        stalled = now - self.last_ready_advance
-
-        if (
-            not self.live_player.is_running()
-            and self.next_playback_chunk > 0
-            and buffered >= self.playback_min_start_bytes
-            and stalled >= self.playback_start_timeout
-        ):
-            if self.live_player.force_start():
-                messages.append(
-                    f"Playback    : session {self.session_id:016x} starting early with "
-                    f"{format_bytes(buffered)} contiguous data after waiting {stalled:.1f}s"
-                )
-                messages.extend(self.live_player.service())
-
-        next_available = self._next_available_pending_chunk()
-        if (
-            self.playback_gap_skip_timeout > 0
-            and next_available is not None
-            and next_available > self.next_playback_chunk
-            and stalled >= self.playback_gap_skip_timeout
-        ):
-            skipped = next_available - self.next_playback_chunk
-            self.playback_skipped_chunks += skipped
-            messages.append(
-                f"Playback    : session {self.session_id:016x} skipped {skipped} missing chunks, "
-                f"resume at chunk {next_available}"
-            )
-            self.next_playback_chunk = next_available
-            self._drain_live_stream()
-            stalled = 0.0
-
-        if (
-            self.chunks_received > self.next_playback_chunk
-            and stalled >= 1.0
-            and (
-                self.last_wait_report_chunk != self.next_playback_chunk
-                or now - self.last_wait_report_at >= 5.0
-            )
-        ):
-            messages.append(
-                f"Playback    : session {self.session_id:016x} waiting for chunk "
-                f"{self.next_playback_chunk} before playback can continue"
-            )
-            self.last_wait_report_chunk = self.next_playback_chunk
-            self.last_wait_report_at = now
-
-        return messages
-
-    def _discard_stale_pending_order(self) -> None:
-        while self.playback_pending_order:
-            chunk_id = self.playback_pending_order[0]
-            if chunk_id < self.next_playback_chunk or chunk_id not in self.playback_pending:
-                heapq.heappop(self.playback_pending_order)
-                continue
-            break
-
-    def _next_available_pending_chunk(self) -> int | None:
-        self._discard_stale_pending_order()
-        if not self.playback_pending_order:
-            return None
-        return self.playback_pending_order[0]
-
-    def _is_ts_transport(self) -> bool:
-        return self.metadata.get("media_type") == "video" and Path(self.transport_name).suffix.lower() == ".ts"
+        expected = infer_chunk_length(chunk_id, self.total_chunks, self.content_size, self.chunk_size)
+        if len(payload) == expected:
+            return payload
+        if len(payload) > expected:
+            return payload[:expected]
+        return payload + b"\x00" * (expected - len(payload))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Receive USRP-forwarded UDP media, rebuild the file, and optionally play video live from contiguous data."
+        description="Receive directory-entry UDP sessions and restore files under the output directory."
     )
     parser.add_argument("--bind-host", default="0.0.0.0", help="Local host/IP to bind.")
     parser.add_argument("--port", required=True, type=int, help="Local UDP port to listen on.")
-    parser.add_argument("--output-dir", default="received", help="Directory for reconstructed files.")
-    parser.add_argument("--idle-timeout", type=float, default=5.0, help="Seconds of silence before timing out a session.")
+    parser.add_argument("--output-dir", default="received", help="Directory where restored files will be written.")
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds without packets for a session before it is reported as incomplete and dropped.",
+    )
+    parser.add_argument(
+        "--post-end-timeout-ms",
+        type=int,
+        default=1000,
+        help="After END arrives, wait this long for any missing chunks before dropping the file.",
+    )
     parser.add_argument("--socket-buffer-kb", type=int, default=32768, help="Socket receive buffer in KiB.")
     parser.add_argument(
         "--packet-queue-size",
@@ -653,121 +175,65 @@ def parse_args() -> argparse.Namespace:
         default=8192,
         help="Number of UDP packets buffered in userspace before processing.",
     )
-    parser.add_argument("--once", action="store_true", help="Exit after one successful session.")
     parser.add_argument(
-        "--live-play",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Automatically start the built-in Python live player for incoming MPEG-TS video once the startup buffer is filled.",
-    )
-    parser.add_argument(
-        "--playback-buffer-kb",
-        type=int,
-        default=1024,
-        help="Contiguous TS data to buffer before starting live playback.",
-    )
-    parser.add_argument(
-        "--playback-min-start-kb",
-        type=int,
-        default=256,
-        help="If contiguous data stalls before reaching --playback-buffer-kb, allow an early start from this much buffered data.",
-    )
-    parser.add_argument(
-        "--playback-start-timeout-ms",
-        type=int,
-        default=1000,
-        help="How long to wait for more contiguous data before starting early with the current contiguous buffer.",
-    )
-    parser.add_argument(
-        "--playback-gap-skip-ms",
-        type=int,
-        default=200,
-        help="If playback is blocked by a missing chunk for this long, skip the gap and continue live playback. Set 0 to disable.",
-    )
-    parser.add_argument(
-        "--playback-rewind-kb",
-        type=int,
-        default=4096,
-        help="Recent live data kept for automatic player restart after the playback window is closed.",
-    )
-    parser.add_argument(
-        "--playback-no-display",
-        action="store_true",
-        help="Decode in real time without opening a playback window. Useful for headless testing.",
-    )
-    parser.add_argument(
-        "--auto-remux",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="If the sender used MPEG-TS preprocessing and packaged ffmpeg is available, restore the original container.",
+        "--exit-when-idle",
+        type=float,
+        default=None,
+        help="For tests: exit once at least one packet has been seen, there are no active sessions, and the receiver stays globally idle for this many seconds.",
     )
     return parser.parse_args()
 
 
-def create_session(
-    output_dir: Path,
-    session_id: int,
-    metadata: dict,
-    live_play: bool,
-    playback_buffer_kb: int,
-    playback_min_start_kb: int,
-    playback_start_timeout_ms: int,
-    playback_gap_skip_ms: int,
-    playback_rewind_kb: int,
-    playback_no_display: bool,
-) -> SessionState:
-    session_dir = output_dir / f"session_{session_id:016x}"
-    session_dir.mkdir(parents=True, exist_ok=True)
+def create_session(output_dir: Path, session_id: int, metadata: dict) -> SessionState:
+    protocol = metadata.get("protocol")
+    if protocol != "usrp_udp_directory_v2":
+        raise ValueError(f"unsupported metadata protocol: {protocol!r}")
 
-    transport_name = safe_filename(metadata["transport_name"])
-    original_name = safe_filename(metadata["original_name"])
-    transport_path = session_dir / transport_name
-    manifest_path = session_dir / "manifest.json"
-    transport_fp = transport_path.open("wb+")
+    entry_type = metadata.get("entry_type")
+    if entry_type not in {"file", "directory"}:
+        raise ValueError(f"unsupported entry type: {entry_type!r}")
 
-    live_player: LivePlayer | None = None
-    playback_disabled_reason: str | None = None
-    is_ts_video = metadata.get("media_type") == "video" and Path(transport_name).suffix.lower() == ".ts"
+    relative_path = metadata["relative_path"]
+    final_path = resolve_output_path(output_dir, relative_path)
     chunk_size = int(metadata["chunk_size"])
-    if live_play and is_ts_video:
-        live_player = LivePlayer(
-            session_id=session_id,
-            transport_name=transport_name,
-            startup_threshold=max(playback_buffer_kb, 0) * 1024,
-            replay_buffer_limit=max(playback_rewind_kb, 0) * 1024,
-            restart_delay=0.5,
-            no_display=playback_no_display,
-        )
-    elif live_play and metadata.get("media_type") == "video":
-        playback_disabled_reason = "live playback requires MPEG-TS transport; keep sender --streamable-ts enabled"
-
-    if is_ts_video and chunk_size % TS_PACKET_SIZE != 0:
-        warning = (
-            f"chunk size {chunk_size} is not aligned to {TS_PACKET_SIZE}-byte TS packets; "
-            "streaming still works, but sender --chunk-size 1316 is preferred for MPEG-TS."
-        )
-        playback_disabled_reason = f"{playback_disabled_reason}; {warning}" if playback_disabled_reason else warning
-
     total_chunks = int(metadata["total_chunks"])
+    content_size = int(metadata["content_size"])
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if total_chunks < 0:
+        raise ValueError("total_chunks must be >= 0")
+    if content_size < 0:
+        raise ValueError("content_size must be >= 0")
+    if entry_type == "directory" and (content_size != 0 or total_chunks != 0):
+        raise ValueError("directory entries must have zero size and zero chunks")
+    if entry_type == "file" and total_chunks == 0 and content_size != 0:
+        raise ValueError("non-empty file entries must have at least one chunk")
+
+    partial_path: Path | None = None
+    output_fp: BinaryIO | None = None
+    if entry_type == "file":
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path = final_path.with_name(f"{final_path.name}.part.{session_id:016x}")
+        try:
+            partial_path.unlink()
+        except FileNotFoundError:
+            pass
+        output_fp = partial_path.open("wb+")
+
     return SessionState(
         session_id=session_id,
-        metadata=metadata,
-        session_dir=session_dir,
-        transport_path=transport_path,
-        manifest_path=manifest_path,
+        sequence_number=int(metadata["sequence_number"]),
+        entry_type=entry_type,
+        relative_path=relative_path,
+        final_path=final_path,
+        partial_path=partial_path,
         chunk_size=chunk_size,
         total_chunks=total_chunks,
-        transport_size=int(metadata["transport_size"]),
-        transport_sha256=metadata["transport_sha256"],
-        transport_name=transport_name,
-        original_name=original_name,
-        transport_fp=transport_fp,
+        content_size=content_size,
+        content_sha256=metadata["content_sha256"],
+        modified_ns=int(metadata.get("modified_ns", 0)),
+        output_fp=output_fp,
         received=bytearray(total_chunks),
-        live_player=live_player,
-        playback_disabled_reason=playback_disabled_reason,
-        playback_min_start_bytes=max(playback_min_start_kb, 0) * 1024,
-        playback_start_timeout=max(playback_start_timeout_ms, 0) / 1000.0,
-        playback_gap_skip_timeout=max(playback_gap_skip_ms, 0) / 1000.0,
     )
 
 
@@ -792,32 +258,25 @@ def socket_reader(
                 continue
 
 
-def finalize_session(state: SessionState, auto_remux: bool) -> None:
-    transport_path, restored_path = state.finalize(auto_remux=auto_remux)
-    print(f"Completed   : session {state.session_id:016x}")
-    print(f"Transport   : {transport_path}")
-    if restored_path:
-        print(f"Restored    : {restored_path}")
-    print(f"Chunks      : {state.chunks_received}/{state.total_chunks}")
-    print(f"Size        : {format_bytes(state.transport_size)}")
-    if state.live_player is not None:
-        print(
-            f"Playback    : fed {format_bytes(state.playback_bytes_emitted)} contiguous data, "
-            f"ready {state.next_playback_chunk}/{state.total_chunks}"
-        )
+def complete_session(state: SessionState) -> Path:
+    restored_path = state.finalize()
+    print(
+        f"Completed   : seq {state.sequence_number}, {state.entry_type} {state.relative_path}, "
+        f"{state.chunks_received}/{state.total_chunks} chunks"
+    )
+    print(f"Restored    : {restored_path}")
+    if state.entry_type == "file":
+        print(f"Size        : {format_bytes(state.content_size)}")
+    return restored_path
 
 
-def close_incomplete_session(state: SessionState, reason: str) -> None:
-    state.close_partial(reason=reason)
-    print(f"Incomplete  : session {state.session_id:016x}, {reason}")
-    print(f"Chunks      : {state.chunks_received}/{state.total_chunks}")
-    if state.live_player is not None:
-        print(
-            f"Playback    : fed {format_bytes(state.playback_bytes_emitted)} contiguous data, "
-            f"ready {state.next_playback_chunk}/{state.total_chunks}"
-        )
-        if state.next_playback_chunk < state.total_chunks:
-            print(f"Playback    : first missing chunk for playback was {state.next_playback_chunk}")
+def drop_session(state: SessionState, reason: str) -> None:
+    missing = state.missing_chunks()
+    state.drop_partial()
+    print(
+        f"Dropped     : seq {state.sequence_number}, {state.entry_type} {state.relative_path}, "
+        f"missing {missing} chunks, {reason}"
+    )
 
 
 def main() -> int:
@@ -836,9 +295,11 @@ def main() -> int:
                 "Choose another port or stop the process currently holding it."
             ) from exc
         raise
+
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, args.socket_buffer_kb * 1024)
     sock.settimeout(0.5)
     actual_socket_buffer = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+
     packet_queue: queue.Queue[tuple[bytes, tuple[str, int]]] = queue.Queue(maxsize=max(args.packet_queue_size, 1))
     stop_event = threading.Event()
     reader_thread = threading.Thread(
@@ -850,7 +311,11 @@ def main() -> int:
     reader_thread.start()
 
     sessions: dict[int, SessionState] = {}
+    recent_sessions: dict[int, float] = {}
     last_report = time.monotonic()
+    last_packet_at = last_report
+    saw_packets = False
+    had_failures = False
 
     print(f"Listening   : {args.bind_host}:{args.port}")
     print(f"Output dir  : {output_dir}")
@@ -867,39 +332,41 @@ def main() -> int:
 
             now = time.monotonic()
             if packet is not None:
+                saw_packets = True
+                last_packet_at = now
                 try:
                     kind, session_id, field_a, field_b, field_c, payload = parse_packet(packet)
                 except ValueError:
                     continue
 
+                recent_sessions = {
+                    completed_session_id: seen_at
+                    for completed_session_id, seen_at in recent_sessions.items()
+                    if now - seen_at <= RECENT_SESSION_TTL
+                }
+
+                if session_id in recent_sessions:
+                    continue
+
                 if kind == PacketKind.START:
-                    metadata = loads_json(payload)
-                    if session_id not in sessions:
-                        state = create_session(
-                            output_dir=output_dir,
-                            session_id=session_id,
-                            metadata=metadata,
-                            live_play=args.live_play,
-                            playback_buffer_kb=args.playback_buffer_kb,
-                            playback_min_start_kb=args.playback_min_start_kb,
-                            playback_start_timeout_ms=args.playback_start_timeout_ms,
-                            playback_gap_skip_ms=args.playback_gap_skip_ms,
-                            playback_rewind_kb=args.playback_rewind_kb,
-                            playback_no_display=args.playback_no_display,
-                        )
-                        sessions[session_id] = state
-                        print(
-                            f"Session     : {session_id:016x} from {peer[0]}:{peer[1]}, "
-                            f"{metadata['media_type']} {metadata['transport_name']}"
-                        )
-                        if state.live_player is not None:
-                            print(
-                                f"Playback    : armed for session {session_id:016x}, "
-                                f"startup {format_bytes(state.live_player.startup_threshold)}, "
-                                f"rewind {format_bytes(state.live_player.replay_buffer_limit)}"
-                            )
-                        if state.playback_disabled_reason:
-                            print(f"Playback    : {state.playback_disabled_reason}")
+                    if session_id in sessions:
+                        continue
+                    try:
+                        metadata = loads_json(payload)
+                        state = create_session(output_dir=output_dir, session_id=session_id, metadata=metadata)
+                    except Exception as exc:
+                        print(f"Rejected    : session {session_id:016x}, {exc}")
+                        had_failures = True
+                        recent_sessions[session_id] = now
+                        continue
+
+                    sessions[session_id] = state
+                    print(
+                        f"Session     : {session_id:016x} from {peer[0]}:{peer[1]}, "
+                        f"seq {state.sequence_number}, {state.entry_type} {state.relative_path}"
+                    )
+                    if state.entry_type == "file":
+                        print(f"Size        : {format_bytes(state.content_size)}")
                     continue
 
                 state = sessions.get(session_id)
@@ -912,49 +379,55 @@ def main() -> int:
                     state.mark_end()
                     if state.is_complete():
                         try:
-                            finalize_session(state, auto_remux=args.auto_remux)
+                            complete_session(state)
                         except Exception as exc:
-                            print(f"Failed      : session {session_id:016x}, {exc}")
-                            return 1
+                            drop_session(state, reason=f"verification failed ({exc})")
+                            had_failures = True
                         sessions.pop(session_id, None)
-                        if args.once:
-                            return 0
+                        recent_sessions[session_id] = now
 
             expired: list[int] = []
-            exit_code = 0
             for session_id, state in list(sessions.items()):
                 state.maybe_flush()
-                for message in state.service_live_playback():
-                    print(message)
-
                 if state.end_received and state.is_complete():
                     try:
-                        finalize_session(state, auto_remux=args.auto_remux)
+                        complete_session(state)
                     except Exception as exc:
-                        print(f"Failed      : session {session_id:016x}, {exc}")
-                        return 1
+                        drop_session(state, reason=f"verification failed ({exc})")
+                        had_failures = True
                     expired.append(session_id)
+                    recent_sessions[session_id] = now
                     continue
 
-                idle = now - state.last_activity
-                if idle > args.idle_timeout:
-                    close_incomplete_session(
-                        state,
-                        reason=f"timed out after {args.idle_timeout:.1f}s while waiting for more correct data",
-                    )
+                if state.end_received and now - state.last_activity >= max(args.post_end_timeout_ms, 0) / 1000.0:
+                    drop_session(state, reason=f"END received and no more data arrived for {args.post_end_timeout_ms} ms")
                     expired.append(session_id)
-                    exit_code = 1
+                    recent_sessions[session_id] = now
+                    had_failures = True
+                    continue
+
+                if now - state.last_activity >= args.idle_timeout:
+                    drop_session(state, reason=f"timed out after {args.idle_timeout:.1f}s")
+                    expired.append(session_id)
+                    recent_sessions[session_id] = now
+                    had_failures = True
 
             for session_id in expired:
                 sessions.pop(session_id, None)
-                if args.once and not sessions:
-                    return exit_code
 
             if now - last_report >= 1.0:
                 interval = now - last_report
                 for state in sessions.values():
                     print(state.progress_line(interval))
                 last_report = now
+
+            if (
+                args.exit_when_idle is not None
+                and saw_packets
+                and not sessions
+                and now - last_packet_at >= args.exit_when_idle
+            ):
+                return 1 if had_failures else 0
     except KeyboardInterrupt:
         print("Stopped     : receiver interrupted by user")
         return 130
@@ -966,7 +439,7 @@ def main() -> int:
             pass
         reader_thread.join(timeout=1.0)
         for state in sessions.values():
-            state.abort()
+            state.drop_partial()
 
 
 if __name__ == "__main__":

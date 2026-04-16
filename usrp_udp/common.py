@@ -2,74 +2,49 @@ from __future__ import annotations
 
 import hashlib
 import json
-import mimetypes
-import re
-import subprocess
+import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
-VIDEO_EXTENSIONS = {
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".mkv",
-    ".wmv",
-    ".flv",
-    ".m4v",
-    ".ts",
-    ".mts",
-    ".m2ts",
-    ".webm",
-}
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".gif",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
-INVALID_FILENAME_CHARS = r'[<>:"/\\|?*\x00-\x1F]'
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+@dataclass(slots=True, frozen=True)
+class EntrySnapshot:
+    root_name: str
+    relative_path: str
+    absolute_path: str
+    entry_type: str
+    size: int
+    modified_ns: int
+
+    @property
+    def signature(self) -> tuple[str, int, int]:
+        return (self.entry_type, self.size, self.modified_ns)
 
 
 @dataclass(slots=True)
-class PreparedMedia:
-    input_path: str
-    original_name: str
-    transport_path: str
-    transport_name: str
-    media_type: str
-    streamable: bool
-    preprocess: dict | None
-    restore_hint: dict | None
+class StagedFile:
+    source_path: Path
+    staged_path: Path
+    size: int
+    sha256: str
+    modified_ns: int
+
+    def cleanup(self) -> None:
+        try:
+            self.staged_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def detect_media_type(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix in VIDEO_EXTENSIONS:
-        return "video"
-    if suffix in IMAGE_EXTENSIONS:
-        return "image"
-
-    mime, _ = mimetypes.guess_type(path.name)
-    if mime:
-        if mime.startswith("video/"):
-            return "video"
-        if mime.startswith("image/"):
-            return "image"
-    return "binary"
-
-
-def safe_filename(name: str) -> str:
-    cleaned = re.sub(INVALID_FILENAME_CHARS, "_", name).rstrip(". ")
-    if not cleaned:
-        return "output.bin"
-    return cleaned
+def ceil_div(value: int, divisor: int) -> int:
+    if divisor <= 0:
+        raise ValueError("divisor must be > 0")
+    return (value + divisor - 1) // divisor
 
 
 def compute_sha256(path: Path) -> str:
@@ -80,8 +55,12 @@ def compute_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
+def dumps_json(payload: dict) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def loads_json(payload: bytes) -> dict:
+    return json.loads(payload.decode("utf-8"))
 
 
 def format_bytes(size: float) -> str:
@@ -98,143 +77,144 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def dumps_json(payload: dict) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def normalize_relative_path(value: str) -> str:
+    candidate = value.replace("\\", "/")
+    pure = PurePosixPath(candidate)
+    if pure.is_absolute():
+        raise ValueError(f"absolute path is not allowed: {value!r}")
+
+    parts: list[str] = []
+    for part in pure.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError(f"parent traversal is not allowed: {value!r}")
+        parts.append(part)
+
+    if not parts:
+        raise ValueError("relative path must not be empty")
+    return "/".join(parts)
 
 
-def loads_json(payload: bytes) -> dict:
-    return json.loads(payload.decode("utf-8"))
+def resolve_output_path(output_dir: Path, relative_path: str) -> Path:
+    normalized = normalize_relative_path(relative_path)
+    candidate = output_dir.joinpath(*PurePosixPath(normalized).parts)
+    output_dir_resolved = output_dir.resolve()
+    candidate_resolved = candidate.resolve(strict=False)
+    if os.path.commonpath([str(output_dir_resolved), str(candidate_resolved)]) != str(output_dir_resolved):
+        raise ValueError(f"path escapes output directory: {relative_path!r}")
+    return candidate
 
 
-def get_ffmpeg_executable() -> str | None:
+def iter_directory_entries(root: Path) -> list[EntrySnapshot]:
+    root = root.resolve()
+    root_name = root.name
+    entries: list[EntrySnapshot] = []
+    for candidate in sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()):
+        if candidate.is_symlink():
+            continue
+        if not (candidate.is_file() or candidate.is_dir()):
+            continue
+        relative_path = candidate.relative_to(root).as_posix()
+        stat = candidate.stat()
+        entry_type = "directory" if candidate.is_dir() else "file"
+        size = 0 if entry_type == "directory" else stat.st_size
+        entries.append(
+            EntrySnapshot(
+                root_name=root_name,
+                relative_path=relative_path,
+                absolute_path=str(candidate),
+                entry_type=entry_type,
+                size=size,
+                modified_ns=stat.st_mtime_ns,
+            )
+        )
+    return entries
+
+
+def stage_file_snapshot(snapshot: EntrySnapshot) -> StagedFile | None:
+    if snapshot.entry_type != "file":
+        raise ValueError("stage_file_snapshot only supports file entries")
+
+    source_path = Path(snapshot.absolute_path)
     try:
-        from imageio_ffmpeg import get_ffmpeg_exe
-    except ImportError:
+        stat_before = source_path.stat()
+    except FileNotFoundError:
         return None
 
+    if stat_before.st_size != snapshot.size or stat_before.st_mtime_ns != snapshot.modified_ns:
+        return None
+
+    digest = hashlib.sha256()
+    fd, temp_name = tempfile.mkstemp(prefix="usrp_udp_send_", suffix=".part")
+    staged_path = Path(temp_name)
+    total_bytes = 0
+
     try:
-        return get_ffmpeg_exe()
+        with os.fdopen(fd, "wb") as destination, source_path.open("rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                destination.write(chunk)
+                digest.update(chunk)
+                total_bytes += len(chunk)
     except Exception:
+        try:
+            staged_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+    try:
+        stat_after = source_path.stat()
+    except FileNotFoundError:
+        staged_path.unlink(missing_ok=True)
         return None
 
+    if (
+        stat_after.st_size != snapshot.size
+        or stat_after.st_mtime_ns != snapshot.modified_ns
+        or total_bytes != snapshot.size
+    ):
+        staged_path.unlink(missing_ok=True)
+        return None
 
-def prepare_media(
-    input_path: Path,
-    prefer_streamable_video: bool,
-) -> tuple[PreparedMedia, tempfile.TemporaryDirectory[str] | None]:
-    media_type = detect_media_type(input_path)
-    temp_dir: tempfile.TemporaryDirectory[str] | None = None
-    transport_path = input_path
-    transport_name = input_path.name
-    streamable = False
-    preprocess = None
-    restore_hint = None
-
-    if media_type == "video" and prefer_streamable_video and input_path.suffix.lower() != ".ts":
-        ffmpeg = get_ffmpeg_executable()
-        if ffmpeg:
-            temp_dir = tempfile.TemporaryDirectory(prefix="usrp_udp_")
-            candidate = Path(temp_dir.name) / f"{input_path.stem}_stream.ts"
-            copy_cmd = [
-                ffmpeg,
-                "-y",
-                "-i",
-                str(input_path),
-                "-map",
-                "0",
-                "-c",
-                "copy",
-                "-muxdelay",
-                "0",
-                "-muxpreload",
-                "0",
-                "-f",
-                "mpegts",
-                str(candidate),
-            ]
-            transcode_cmd = [
-                ffmpeg,
-                "-y",
-                "-i",
-                str(input_path),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-muxdelay",
-                "0",
-                "-muxpreload",
-                "0",
-                "-f",
-                "mpegts",
-                str(candidate),
-            ]
-
-            succeeded = _run_ffmpeg(copy_cmd) or _run_ffmpeg(transcode_cmd)
-            if succeeded and candidate.exists() and candidate.stat().st_size > 0:
-                transport_path = candidate
-                transport_name = f"{input_path.stem}.ts"
-                streamable = True
-                preprocess = {"type": "ffmpeg_to_mpegts"}
-                restore_hint = {
-                    "type": "ffmpeg_remux",
-                    "target_name": input_path.name,
-                }
-            else:
-                temp_dir.cleanup()
-                temp_dir = None
-
-    prepared = PreparedMedia(
-        input_path=str(input_path),
-        original_name=input_path.name,
-        transport_path=str(transport_path),
-        transport_name=transport_name,
-        media_type=media_type,
-        streamable=streamable,
-        preprocess=preprocess,
-        restore_hint=restore_hint,
+    return StagedFile(
+        source_path=source_path,
+        staged_path=staged_path,
+        size=total_bytes,
+        sha256=digest.hexdigest(),
+        modified_ns=snapshot.modified_ns,
     )
-    return prepared, temp_dir
 
 
-def _run_ffmpeg(command: list[str]) -> bool:
-    result = subprocess.run(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return result.returncode == 0
-
-
-def build_metadata(
-    prepared: PreparedMedia,
+def build_entry_metadata(
+    snapshot: EntrySnapshot,
     chunk_size: int,
-    transport_size: int,
-    transport_sha256: str,
+    content_sha256: str,
+    sequence_number: int,
 ) -> dict:
-    total_chunks = ceil_div(transport_size, chunk_size)
+    total_chunks = ceil_div(snapshot.size, chunk_size) if chunk_size > 0 else 0
     return {
-        "protocol": "usrp_udp_media_v1",
+        "protocol": "usrp_udp_directory_v2",
         "created_at": utc_now_iso(),
-        **asdict(prepared),
+        "sequence_number": sequence_number,
+        "root_name": snapshot.root_name,
+        "relative_path": snapshot.relative_path,
+        "entry_type": snapshot.entry_type,
         "chunk_size": chunk_size,
-        "transport_size": transport_size,
+        "content_size": snapshot.size,
         "total_chunks": total_chunks,
-        "transport_sha256": transport_sha256,
-        "transport_sha256_algo": "sha256",
+        "content_sha256": content_sha256,
+        "content_sha256_algo": "sha256",
+        "modified_ns": snapshot.modified_ns,
     }
 
 
 def infer_chunk_length(chunk_id: int, total_chunks: int, total_size: int, chunk_size: int) -> int:
+    if total_chunks == 0:
+        raise ValueError("zero-chunk entries do not have chunk lengths")
     if chunk_id < 0 or chunk_id >= total_chunks:
         raise ValueError("chunk_id out of range")
     if chunk_id == total_chunks - 1:

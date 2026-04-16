@@ -1,4 +1,1 @@
-av==17.0.0
-imageio-ffmpeg==0.6.0
-numpy==2.4.3
-opencv-python==4.13.0.92
+# Current sender/receiver implementation uses only the Python standard library.

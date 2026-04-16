@@ -1,184 +1,134 @@
-# USRP UDP 上位机发送与接收
+# USRP UDP 共享目录传输
 
-这个项目包含两个上位机程序：
+这个项目现在用于在两台电脑之间通过 USRP 透明转发的 UDP 链路同步一个共享目录。
 
-- `sender.py`：把图片或视频按固定分片封装成 UDP 数据帧并发出。
-- `receiver.py`：接收 UDP 数据帧，按分片号重组文件；视频在收到连续 TS 数据后可实时播放。
+发送端运行 `sender.py`，持续扫描 `shared/`（或你指定的目录），把其中的目录项按相对路径顺序逐个封装成 UDP 会话发送出去。
+接收端运行 `receiver.py`，按收到的相对路径把文件和目录恢复到输出目录中。
 
-中间 USRP 链路默认只做 UDP 透明转发；本项目不参与 LTE 侧纠错。
+当前设计假设：
 
-## 当前特性
+- LTE / USRP 链路不会把错误比特上传给上层。
+- 上层需要处理的是丢包，不是比特翻转。
+- 如果某个文件会话缺包，接收端会报告丢失并丢弃这个文件的临时副本，然后继续接收后续文件。
+- 如果某个文件后续再次更新，发送端会把新的稳定版本重新发送，接收端会覆盖恢复为最新版。
 
-- 图片传输后可按原文件恢复。
-- 视频默认先转成 `MPEG-TS` 再发送，便于接收端边收边播。
-- 接收端默认会在短暂等待后跳过丢失数据，继续往后直播播放。
-- 如果传输变慢或中间缺数据，播放会卡住等待，不会主动补帧或跳帧。
-- 如果传输更快，接收端会积累缓存再按视频时间戳播放。
-- 如果手动关闭播放窗口，接收端会基于最近缓存自动重启播放器。
+## 当前行为
+
+- 递归发送整个目录树中的文件和目录。
+- 文件按相对路径恢复，内容按原始字节恢复。
+- 文件只在接收完整且 SHA256 校验通过后才替换正式文件。
+- 目录会被单独同步，因此空目录也能恢复。
+- 发送端默认持续轮询目录，发现新增或更新的稳定文件后立即发送。
+- 接收端默认持续运行，可连续接收多个文件会话。
+- 如果某个会话收到了 `END` 但仍缺块，接收端会在短暂等待后报告缺包并跳过该文件。
 
 ## 环境安装
 
-现在不再需要系统单独安装 `ffmpeg` 或 `ffplay`。
-
-`requirements.txt` 已经包含运行所需 Python 依赖，下面这条命令可以直接装全：
+当前版本仅依赖 Python 标准库。
 
 ```powershell
 pip install -r .\requirements.txt
 ```
 
-更推荐用项目自己的虚拟环境：
+如果你想单独用项目虚拟环境：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup_env.ps1
 ```
 
-如果 `.venv` 已经存在，脚本会直接复用它并更新依赖，不会重复重建。
-如果你明确需要重建环境：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\setup_env.ps1 -Recreate
-```
-
-或者手工执行：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r .\requirements.txt
-```
-
-安装完成后，视频相关能力由这些包提供：
-
-- `imageio-ffmpeg`：发送端视频转 TS，接收端收完后的容器还原
-- `av`：接收端实时解码 MPEG-TS
-- `opencv-python`：接收端实时显示视频窗口
-
-说明：
-
-- 实时播放是视频播放，不额外输出实时音频。
-- 收完后还原出的原始文件仍会保留音视频内容。
-
 ## 发送端用法
 
-发送图片：
+持续扫描 `shared/` 并发送：
 
 ```powershell
-python .\sender.py --input ".\input.jpg" --host 169.254.46.237 --port 50000
+python .\sender.py --input-dir .\shared --host 169.254.46.237 --port 50000
 ```
 
-发送视频：
+只发送当前目录快照，发完退出：
 
 ```powershell
-python .\sender.py --input ".\input.mp4" --host 169.254.46.237 --port 50000
+python .\sender.py --input-dir .\shared --host 169.254.46.237 --port 50000 --scan-once
 ```
 
 常用参数：
 
-- `--chunk-size 1316`：每个 UDP 数据包负载大小，默认 `1316`，适合 MPEG-TS。
-- `--target-rate-mbps 8`：按目标有效载荷吞吐率发包，推荐直接用这个参数做速率控制。
-- `--packet-interval-us 200`：按固定包间隔发包；设置了 `--target-rate-mbps` 后会被忽略。
-- `--streamable-ts` / `--no-streamable-ts`：视频是否先转成 TS 再发送。
+- `--input-dir .\shared`：要递归发送的目录。
+- `--chunk-size 1316`：每个 UDP 数据包的有效载荷大小。
+- `--target-rate-mbps 8`：按目标有效载荷速率发包，单位是 `MB/s`。
+- `--packet-interval-us 200`：固定包间隔；设置了 `--target-rate-mbps` 后忽略。
+- `--scan-interval-ms 500`：目录轮询间隔。
+- `--settle-ms 500`：文件在这段时间内保持不变后才会被发送，用于避开发送正在写入中的中间态。
+- `--scan-once`：只发送当前稳定快照，不持续 watch。
 
 发送端日志会显示：
 
-- 输入文件与实际传输文件
-- 是否转成了流式 TS
-- 总分片数
-- 当前发送吞吐率
-- 当前包速率和预计剩余时间
+- 当前发送的相对路径
+- 会话序号和会话 ID
+- 文件大小和 chunk 数
+- 当前吞吐率
+- 退出时的总条目数、总字节数、总包数
 
 ## 接收端用法
 
-接收并实时播放视频：
+持续接收并恢复到 `received/`：
 
 ```powershell
 python .\receiver.py --bind-host 0.0.0.0 --port 60000 --output-dir .\received
 ```
 
-如果只是做本机自动测试，不想弹播放窗口：
+本机测试时，接收完一段传输后如果全局空闲 2 秒就退出：
 
 ```powershell
-python .\receiver.py --bind-host 127.0.0.1 --port 9000 --output-dir .\received --once --playback-no-display
+python .\receiver.py --bind-host 127.0.0.1 --port 9000 --output-dir .\received --exit-when-idle 2
 ```
 
 常用参数：
 
-- `--live-play` / `--no-live-play`：是否启用实时播放，默认开启。
-- `--playback-buffer-kb 1024`：理想起播前的连续缓存大小；大一些更稳。
-- `--playback-min-start-kb 256`：如果连续数据提前卡住，允许用这部分连续缓存提前起播。
-- `--playback-start-timeout-ms 1000`：连续数据迟迟接不上时，等多久后按当前连续缓存提前起播。
-- `--playback-gap-skip-ms 200`：如果直播被某个丢失 chunk 卡住这么久，就跳过这个缺口继续播；设为 `0` 表示严格等待，不跳过。
-- `--playback-rewind-kb 4096`：关闭播放窗口后自动重启时可回放的最近缓存。
-- `--idle-timeout 5`：超过多久没收到新数据就判定会话超时。
-- `--auto-remux` / `--no-auto-remux`：接收完成后是否自动还原回原始容器。
-- `--packet-queue-size 8192`：接收端用户态收包队列，抗突发更强。
+- `--output-dir .\received`：恢复后的目录根路径。
+- `--idle-timeout 5`：某个会话长时间没有后续数据时，按失败处理。
+- `--post-end-timeout-ms 1000`：已经收到 `END` 后，如果仍缺块，等待多久后报告缺包并跳过该文件。
+- `--packet-queue-size 8192`：用户态收包队列长度。
+- `--exit-when-idle 2`：测试辅助参数。看到至少一个包后，如果没有活跃会话并且全局空闲达到设定秒数，就退出。
 
 接收端日志会显示：
 
-- 当前接收进度
-- 实时接收吞吐率 `rx`
-- 实时送入连续播放缓冲的数据率 `feed`
-- 当前缓存大小 `buffer`
-- 已连续可播放到的分片位置 `ready`
-- 如果出现 `wait N`，表示正在等第 `N` 个 chunk，后面的数据虽然收到了，但还不能继续播放
-- 如果出现 `skipped N`，表示直播为了继续播放，已经跳过了 `N` 个丢失 chunk
+- 新会话的相对路径和序号
+- 完成恢复的文件路径
+- 未完成文件的缺块数和丢弃原因
+- 活跃会话的接收进度
 
-## 8 MB/s 调参建议
+## 丢包处理
 
-如果你的目标是约 `8 MB/s` 有效载荷吞吐率，建议先这样测：
+当前版本的丢包策略是：
 
-```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 60000 --output-dir .\received --no-live-play --socket-buffer-kb 32768
-python .\sender.py --input ".\input.mp4" --host 169.254.46.237 --port 50000 --target-rate-mbps 8 --chunk-size 1316
-```
+1. 已收到的 chunk 直接按偏移写入临时文件。
+2. 如果所有 chunk 都收到并且 SHA256 校验通过，就原子替换正式文件。
+3. 如果在 `END` 之后仍缺 chunk，或者会话超时，则打印丢包报告。
+4. 失败文件的临时副本会被删除，不会污染输出目录。
+5. 后续文件会继续正常接收和恢复。
 
-建议顺序：
+这对应你当前的要求：先报告并跳过坏文件，后续更复杂的丢包处理策略可以后面再接着加。
 
-- 先用 `--no-live-play` 测纯接收吞吐，确认网口和接收写盘能不能稳住 `8 MB/s`
-- 纯接收稳定后，再打开实时播放看解码显示会不会拖慢
-- 如果还不够，再尝试 `--chunk-size 1400`
-- 如果只是做吞吐测试，可临时加 `--control-repeat 1 --control-interval-ms 0`，减少短文件测试里的控制包固定开销
-- 如果接收端日志里长期停在 `wait 749` 这类位置，说明前面某个 chunk 没收到；默认直播模式会在短暂等待后跳过这个缺口继续播
+## 本地回环测试
 
-说明：
-
-- `8 MB/s` 有效载荷大约对应 `64 Mb/s` 以上的链路负载，算上 UDP/IP/以太网开销会更高一点
-- 千兆网口基本没问题；百兆网口通常也还能试，但余量会小很多
-
-## 典型流程
-
-先启动接收端：
+静态目录快照测试：
 
 ```powershell
-python .\receiver.py --bind-host 0.0.0.0 --port 60000 --output-dir .\received --playback-buffer-kb 1024
+python .\receiver.py --bind-host 127.0.0.1 --port 9100 --output-dir .\tmp_out --exit-when-idle 1
+python .\sender.py --input-dir .\shared --host 127.0.0.1 --port 9100 --scan-once --settle-ms 0
 ```
 
-再启动发送端：
+持续 watch 测试：
 
 ```powershell
-python .\sender.py --input ".\input.mp4" --host 169.254.46.237 --port 50000
+python .\receiver.py --bind-host 127.0.0.1 --port 9100 --output-dir .\tmp_out --exit-when-idle 4
+python .\sender.py --input-dir .\shared --host 127.0.0.1 --port 9100 --scan-interval-ms 200 --settle-ms 200
 ```
 
-如果是本机回环测试，把发送端目标地址改成 `127.0.0.1`，端口与接收端保持一致。
+## 与 USRP 对接
 
-## 输出目录
-
-每次接收结果默认保存在：
-
-```text
-received/session_<session_id>/
-```
-
-通常包含：
-
-- 传输过程中的 `transport` 文件
-- 自动还原出的原始文件
-- `manifest.json`
-
-## 与 USRP 对接时的建议
-
-- 发送端 `--host` / `--port` 指向发射侧 USRP 的 UDP 输入地址。
-- 接收端监听端口与接收侧 USRP 的 UDP 输出端口保持一致。
-- 如果链路吞吐不够，实时播放会卡住等待后续连续数据，这是当前设计预期。
-- 如果链路吞吐有余量，接收端缓存会变大，播放会更稳。
-- 如果中间链路 MTU 偏小，减小 `--chunk-size`，避免底层 IP 分片。
+- `sender.py --host --port` 指向发射侧 USRP 的 UDP 输入地址。
+- `receiver.py --port` 对应接收侧 USRP 的 UDP 输出端口。
+- 这套上位机逻辑不参与 LTE 侧纠错。
+- 如果链路没有干扰且不丢包，接收端恢复出的文件与发送端原文件一致。
+- 如果链路丢包，接收端会报告该文件缺失的 chunk 数并跳过该文件，继续恢复后续文件。

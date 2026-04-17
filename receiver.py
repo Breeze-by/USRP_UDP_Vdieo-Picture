@@ -19,8 +19,8 @@ from usrp_udp.common import (
 )
 from usrp_udp.protocol import PacketKind, parse_packet
 
-
 RECENT_SESSION_TTL = 10.0
+RECEIVE_DIVIDER = "=" * 78
 
 
 def apply_modified_time(path: Path, modified_ns: int) -> None:
@@ -100,9 +100,9 @@ class SessionState:
         self.last_report_rx_bytes = self.received_payload_bytes
         progress = self.chunks_received / self.total_chunks * 100.0 if self.total_chunks else 100.0
         return (
-            f"Progress    : seq {self.sequence_number} {self.relative_path} "
-            f"{self.chunks_received}/{self.total_chunks} chunks ({progress:.1f}%), "
-            f"rx {format_bytes(rx_delta / interval if interval > 0 else 0.0)}/s"
+            f"progress RX {self.sequence_number:04d} | "
+            f"{self.chunks_received}/{self.total_chunks} ({progress:.1f}%) "
+            f"| rx={format_bytes(rx_delta / interval if interval > 0 else 0.0)}/s"
         )
 
     def finalize(self) -> Path:
@@ -258,25 +258,46 @@ def socket_reader(
                 continue
 
 
+def print_receiver_header(
+    bind_host: str,
+    port: int,
+    output_dir: Path,
+    requested_socket_buffer_kb: int,
+    actual_socket_buffer: int,
+    packet_queue_size: int,
+) -> None:
+    print(f"Listen      : {bind_host}:{port}")
+    print(f"Output      : {output_dir}")
+    print(
+        f"Buffer      : requested {format_bytes(requested_socket_buffer_kb * 1024)}, "
+        f"actual {format_bytes(actual_socket_buffer)}, queue {packet_queue_size} packets"
+    )
+
+
+def print_session_start(state: SessionState, peer: tuple[str, int]) -> None:
+    print()
+    print(RECEIVE_DIVIDER)
+    print(f"RX {state.sequence_number:04d} | {state.entry_type} | {state.relative_path}")
+    print(
+        f"session={state.session_id:016x} from={peer[0]}:{peer[1]} "
+        f"size={format_bytes(state.content_size)} chunks={state.total_chunks}"
+    )
+
+
 def complete_session(state: SessionState) -> Path:
     restored_path = state.finalize()
+    print(f"done   RX {state.sequence_number:04d} | restored={restored_path}")
     print(
-        f"Completed   : seq {state.sequence_number}, {state.entry_type} {state.relative_path}, "
-        f"{state.chunks_received}/{state.total_chunks} chunks"
+        f"stats  RX {state.sequence_number:04d} | "
+        f"chunks={state.chunks_received}/{state.total_chunks} | size={format_bytes(state.content_size)}"
     )
-    print(f"Restored    : {restored_path}")
-    if state.entry_type == "file":
-        print(f"Size        : {format_bytes(state.content_size)}")
     return restored_path
 
 
 def drop_session(state: SessionState, reason: str) -> None:
     missing = state.missing_chunks()
     state.drop_partial()
-    print(
-        f"Dropped     : seq {state.sequence_number}, {state.entry_type} {state.relative_path}, "
-        f"missing {missing} chunks, {reason}"
-    )
+    print(f"drop   RX {state.sequence_number:04d} | missing={missing}/{state.total_chunks} | reason={reason}")
 
 
 def main() -> int:
@@ -317,10 +338,14 @@ def main() -> int:
     saw_packets = False
     had_failures = False
 
-    print(f"Listening   : {args.bind_host}:{args.port}")
-    print(f"Output dir  : {output_dir}")
-    print(f"Socket buf  : requested {format_bytes(args.socket_buffer_kb * 1024)}, actual {format_bytes(actual_socket_buffer)}")
-    print(f"Queue size  : {args.packet_queue_size} packets")
+    print_receiver_header(
+        bind_host=args.bind_host,
+        port=args.port,
+        output_dir=output_dir,
+        requested_socket_buffer_kb=args.socket_buffer_kb,
+        actual_socket_buffer=actual_socket_buffer,
+        packet_queue_size=args.packet_queue_size,
+    )
 
     try:
         while True:
@@ -355,18 +380,13 @@ def main() -> int:
                         metadata = loads_json(payload)
                         state = create_session(output_dir=output_dir, session_id=session_id, metadata=metadata)
                     except Exception as exc:
-                        print(f"Rejected    : session {session_id:016x}, {exc}")
+                        print(f"reject RX ???? | session={session_id:016x} | reason={exc}")
                         had_failures = True
                         recent_sessions[session_id] = now
                         continue
 
                     sessions[session_id] = state
-                    print(
-                        f"Session     : {session_id:016x} from {peer[0]}:{peer[1]}, "
-                        f"seq {state.sequence_number}, {state.entry_type} {state.relative_path}"
-                    )
-                    if state.entry_type == "file":
-                        print(f"Size        : {format_bytes(state.content_size)}")
+                    print_session_start(state, peer)
                     continue
 
                 state = sessions.get(session_id)
@@ -429,6 +449,7 @@ def main() -> int:
             ):
                 return 1 if had_failures else 0
     except KeyboardInterrupt:
+        print()
         print("Stopped     : receiver interrupted by user")
         return 130
     finally:

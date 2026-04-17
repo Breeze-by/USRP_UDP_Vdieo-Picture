@@ -54,6 +54,7 @@ python .\sender.py --input-dir .\shared --host 169.254.46.237 --port 50000 --sca
 
 - `--input-dir .\shared`：要递归发送的目录。
 - `--chunk-size 1316`：每个 UDP 数据包的有效载荷大小。
+- `--fast`：快速模式。控制包只发 1 次，默认不再插入包间隔，适合优先追求速度的场景。
 - `--target-rate-mbps 8`：按目标有效载荷速率发包，单位是 `MB/s`。
 - `--packet-interval-us 200`：固定包间隔；设置了 `--target-rate-mbps` 后忽略。
 - `--scan-interval-ms 500`：目录轮询间隔。
@@ -62,10 +63,10 @@ python .\sender.py --input-dir .\shared --host 169.254.46.237 --port 50000 --sca
 
 发送端日志会显示：
 
-- 当前发送的相对路径
-- 会话序号和会话 ID
+- 每个文件独立的发送块
+- 会话序号、会话 ID、目标地址
 - 文件大小和 chunk 数
-- 当前吞吐率
+- 每个文件的完成耗时与吞吐率
 - 退出时的总条目数、总字节数、总包数
 
 ## 接收端用法
@@ -116,6 +117,12 @@ python .\receiver.py --bind-host 127.0.0.1 --port 9000 --output-dir .\received -
 ```powershell
 python .\receiver.py --bind-host 127.0.0.1 --port 9100 --output-dir .\tmp_out --exit-when-idle 1
 python .\sender.py --input-dir .\shared --host 127.0.0.1 --port 9100 --scan-once --settle-ms 0
+```
+
+快速模式测试：
+
+```powershell
+python .\sender.py --input-dir .\shared --host 127.0.0.1 --port 9100 --scan-once --fast
 ```
 
 持续 watch 测试：

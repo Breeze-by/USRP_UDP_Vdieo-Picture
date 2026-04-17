@@ -20,6 +20,12 @@ from usrp_udp.common import (
 from usrp_udp.protocol import PacketKind, build_packet
 
 
+DEFAULT_PACKET_INTERVAL_US = 200
+DEFAULT_CONTROL_REPEAT = 3
+DEFAULT_CONTROL_INTERVAL_MS = 50
+TRANSFER_DIVIDER = "=" * 78
+
+
 def precise_sleep_until(deadline: float) -> None:
     while True:
         remaining = deadline - time.perf_counter()
@@ -50,6 +56,17 @@ class PacketPacer:
             self.sent_packets += 1
             deadline = self.start_time + (self.sent_packets * self.packet_interval_sec)
             precise_sleep_until(deadline)
+
+
+@dataclass(slots=True, frozen=True)
+class TransferSettings:
+    packet_interval_us: int
+    packet_interval_sec: float
+    target_rate_mbps: float | None
+    target_rate_bytes_per_sec: float | None
+    control_repeat: int
+    control_interval_ms: int
+    mode_label: str
 
 
 @dataclass(slots=True)
@@ -146,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--packet-interval-us",
         type=int,
-        default=200,
+        default=DEFAULT_PACKET_INTERVAL_US,
         help="Delay between UDP packets in microseconds. Ignored when --target-rate-mbps is set.",
     )
     parser.add_argument(
@@ -158,14 +175,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-repeat",
         type=int,
-        default=3,
+        default=DEFAULT_CONTROL_REPEAT,
         help="How many times START/END control frames are repeated.",
     )
     parser.add_argument(
         "--control-interval-ms",
         type=int,
-        default=50,
+        default=DEFAULT_CONTROL_INTERVAL_MS,
         help="Delay between repeated START/END control frames in milliseconds.",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Best-effort fast mode: single START/END control frame and no packet gap unless --target-rate-mbps is set.",
     )
     parser.add_argument(
         "--socket-buffer-kb",
@@ -193,6 +215,67 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_transfer_settings(args: argparse.Namespace) -> TransferSettings:
+    packet_interval_us = args.packet_interval_us
+    control_repeat = args.control_repeat
+    control_interval_ms = args.control_interval_ms
+    mode_label = "normal"
+
+    if args.fast:
+        mode_label = "fast"
+        control_repeat = 1
+        control_interval_ms = 0
+        if args.target_rate_mbps is None:
+            packet_interval_us = 0
+
+    target_rate_bytes_per_sec = args.target_rate_mbps * 1_000_000.0 if args.target_rate_mbps is not None else None
+    return TransferSettings(
+        packet_interval_us=packet_interval_us,
+        packet_interval_sec=packet_interval_us / 1_000_000.0,
+        target_rate_mbps=args.target_rate_mbps,
+        target_rate_bytes_per_sec=target_rate_bytes_per_sec,
+        control_repeat=control_repeat,
+        control_interval_ms=control_interval_ms,
+        mode_label=mode_label,
+    )
+
+
+def print_transfer_start(
+    sequence_number: int,
+    session_id: int,
+    snapshot: EntrySnapshot,
+    content_size: int,
+    total_chunks: int,
+    destination: tuple[str, int],
+) -> None:
+    print()
+    print(TRANSFER_DIVIDER)
+    print(f"TX {sequence_number:04d} | {snapshot.entry_type} | {snapshot.relative_path}")
+    print(
+        f"session={session_id:016x} size={format_bytes(content_size)} "
+        f"chunks={total_chunks} target={destination[0]}:{destination[1]}"
+    )
+
+
+def print_transfer_finish(
+    sequence_number: int,
+    elapsed: float,
+    data_packets: int,
+    control_packets: int,
+    sent_packets: int,
+    session_rate: float,
+    data_rate: float,
+) -> None:
+    print(
+        f"done   TX {sequence_number:04d} | elapsed={elapsed:.2f}s "
+        f"| packets=data {data_packets}, ctrl {control_packets}, total {sent_packets}"
+    )
+    print(
+        f"rate   TX {sequence_number:04d} | overall={format_bytes(session_rate)}/s "
+        f"| data={format_bytes(data_rate)}/s"
+    )
+
+
 def send_control(
     sock: socket.socket,
     destination: tuple[str, int],
@@ -215,8 +298,7 @@ def send_snapshot(
     snapshot: EntrySnapshot,
     sequence_number: int,
     args: argparse.Namespace,
-    target_rate_bytes_per_sec: float | None,
-    packet_interval_sec: float,
+    settings: TransferSettings,
 ) -> dict | None:
     staged = None
     try:
@@ -242,13 +324,14 @@ def send_snapshot(
         total_chunks = metadata["total_chunks"]
         session_id = secrets.randbits(64)
 
-        print(
-            f"Sending     : seq {sequence_number}, session {session_id:016x}, "
-            f"{snapshot.entry_type} {snapshot.relative_path}"
+        print_transfer_start(
+            sequence_number=sequence_number,
+            session_id=session_id,
+            snapshot=snapshot,
+            content_size=content_size,
+            total_chunks=total_chunks,
+            destination=destination,
         )
-        print(f"Size        : {format_bytes(content_size)}")
-        print(f"Chunks      : {total_chunks}")
-        print(f"Target      : {destination[0]}:{destination[1]}")
 
         start_payload = dumps_json(metadata)
         end_payload = dumps_json(
@@ -267,8 +350,8 @@ def send_snapshot(
         control_packets = 0
         start_time = time.perf_counter()
         pacer = PacketPacer(
-            target_rate_bytes_per_sec=target_rate_bytes_per_sec,
-            packet_interval_sec=packet_interval_sec,
+            target_rate_bytes_per_sec=settings.target_rate_bytes_per_sec,
+            packet_interval_sec=settings.packet_interval_sec,
         )
 
         send_control(
@@ -277,12 +360,12 @@ def send_snapshot(
             PacketKind.START,
             session_id,
             start_payload,
-            repeat=args.control_repeat,
-            interval_ms=args.control_interval_ms,
+            repeat=settings.control_repeat,
+            interval_ms=settings.control_interval_ms,
         )
-        sent_packets += args.control_repeat
-        sent_bytes += len(start_payload) * args.control_repeat
-        control_packets += args.control_repeat
+        sent_packets += settings.control_repeat
+        sent_bytes += len(start_payload) * settings.control_repeat
+        control_packets += settings.control_repeat
 
         data_phase_start = time.perf_counter()
         if source_path is not None:
@@ -318,9 +401,9 @@ def send_snapshot(
                         rate = delta_bytes / interval if interval > 0 else 0.0
                         packet_rate = delta_packets / interval if interval > 0 else 0.0
                         print(
-                            f"Progress    : seq {sequence_number} "
-                            f"{chunk_id}/{total_chunks} chunks ({progress:.1f}%), "
-                            f"tx {format_bytes(rate)}/s, {packet_rate:.0f} pkt/s"
+                            f"progress TX {sequence_number:04d} | "
+                            f"{chunk_id}/{total_chunks} ({progress:.1f}%) "
+                            f"| tx={format_bytes(rate)}/s | {packet_rate:.0f} pkt/s"
                         )
                         last_report = now
                         last_report_bytes = sent_bytes
@@ -333,23 +416,27 @@ def send_snapshot(
             PacketKind.END,
             session_id,
             end_payload,
-            repeat=args.control_repeat,
-            interval_ms=args.control_interval_ms,
+            repeat=settings.control_repeat,
+            interval_ms=settings.control_interval_ms,
         )
-        sent_packets += args.control_repeat
-        sent_bytes += len(end_payload) * args.control_repeat
-        control_packets += args.control_repeat
+        sent_packets += settings.control_repeat
+        sent_bytes += len(end_payload) * settings.control_repeat
+        control_packets += settings.control_repeat
 
         elapsed = time.perf_counter() - start_time
         session_rate = sent_bytes / elapsed if elapsed > 0 else 0.0
         data_elapsed = data_phase_end - data_phase_start
         data_rate = content_size / data_elapsed if data_elapsed > 0 else 0.0
 
-        print(
-            f"Finished    : seq {sequence_number}, data {data_packets}, control {control_packets}, "
-            f"total {sent_packets} packets in {elapsed:.2f}s"
+        print_transfer_finish(
+            sequence_number=sequence_number,
+            elapsed=elapsed,
+            data_packets=data_packets,
+            control_packets=control_packets,
+            sent_packets=sent_packets,
+            session_rate=session_rate,
+            data_rate=data_rate,
         )
-        print(f"Throughput  : {format_bytes(session_rate)}/s overall, {format_bytes(data_rate)}/s during DATA")
 
         return {
             "entry_type": snapshot.entry_type,
@@ -371,10 +458,15 @@ def main() -> int:
         raise ValueError("--chunk-size must be between 1 and 1400")
     if args.target_rate_mbps is not None and args.target_rate_mbps <= 0:
         raise ValueError("--target-rate-mbps must be > 0")
+    if args.control_repeat <= 0:
+        raise ValueError("--control-repeat must be > 0")
+    if args.packet_interval_us < 0:
+        raise ValueError("--packet-interval-us must be >= 0")
+    if args.control_interval_ms < 0:
+        raise ValueError("--control-interval-ms must be >= 0")
 
     destination = (args.host, args.port)
-    packet_interval_sec = args.packet_interval_us / 1_000_000.0
-    target_rate_bytes_per_sec = args.target_rate_mbps * 1_000_000.0 if args.target_rate_mbps is not None else None
+    settings = resolve_transfer_settings(args)
     tracker = DirectoryTracker(root=input_dir, settle_sec=max(args.settle_ms, 0) / 1000.0)
     pending: deque[EntrySnapshot] = deque()
     sequence_number = 1
@@ -387,10 +479,12 @@ def main() -> int:
 
     print(f"Input dir   : {input_dir}")
     print(f"Target      : {args.host}:{args.port}")
-    if target_rate_bytes_per_sec is not None:
-        print(f"Target rate : {args.target_rate_mbps:.2f} MB/s payload")
+    print(f"Speed mode  : {settings.mode_label}")
+    if settings.target_rate_bytes_per_sec is not None:
+        print(f"Rate limit  : {settings.target_rate_mbps:.2f} MB/s payload")
     else:
-        print(f"Packet gap  : {args.packet_interval_us} us")
+        print(f"Packet gap  : {settings.packet_interval_us} us")
+    print(f"Control     : repeat {settings.control_repeat}, gap {settings.control_interval_ms} ms")
     print(f"Scan mode   : {'single snapshot' if args.scan_once else 'continuous watch'}")
     print(f"Settle time : {args.settle_ms} ms")
     print(f"Scan every  : {args.scan_interval_ms} ms")
@@ -423,8 +517,7 @@ def main() -> int:
                     snapshot=snapshot,
                     sequence_number=sequence_number,
                     args=args,
-                    target_rate_bytes_per_sec=target_rate_bytes_per_sec,
-                    packet_interval_sec=packet_interval_sec,
+                    settings=settings,
                 )
                 if result is None:
                     continue
@@ -446,6 +539,7 @@ def main() -> int:
 
             time.sleep(max(args.scan_interval_ms, 1) / 1000.0)
     except KeyboardInterrupt:
+        print()
         print("Stopped     : sender interrupted by user")
         return 130
     finally:
